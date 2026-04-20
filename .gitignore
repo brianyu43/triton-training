@@ -1,0 +1,24 @@
+bin/
+build/
+results/
+*.o
+*.out
+*.csv
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Triton cache
+.triton/
+
+# Editor / IDE
+.vscode/
+.idea/
