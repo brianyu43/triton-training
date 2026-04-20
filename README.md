@@ -3,7 +3,7 @@
 CUDA → Triton 커널을 lesson 단위로 쌓는 개인 훈련 레포. 각 커널은 *측정과 해석이 가능한 형태* 로 구현하고, lesson별 handoff 문서에 의사결정/속도/막힌 포인트를 남긴다.
 
 6개월 Phase 1 목표: vLLM / Triton / Flash Attention 같은 GPU 서빙 스택에서 판단 가능한 엔지니어로 착지.
-
+-> 손코딩열심히 
 ---
 
 ## 현재 범위 (Lesson 01 → 09)
