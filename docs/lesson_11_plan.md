@@ -162,27 +162,27 @@ def paged_attention_decode_kernel(
 
 ---
 
-### Phase 3 — 성능 + 프로파일 (3-4 일)
+### Phase 3 — 성능 + 프로파일 (3-4 일) ✅ 2026-04-22 (speed)
 **목표**: 언제 paged 가 contiguous 대비 빠르고/느린가를 숫자로 고정.
 
-**벤치**
-- **A**: Lesson 09 contiguous (N = ctx_len, B 개 sequence)
-- **B**: 우리 paged (same 유효 토큰수)
-- **C**: `vllm.paged_attention` (설치되면, optional reference)
+**벤치 결과 (L4, fp16, 10 shapes)** — 상세 표: [`lesson_11_phase3_findings.md`](./lesson_11_phase3_findings.md)
 
-**스윕**
-- `block_size ∈ {8, 16, 32, 64, 128}` — sweet spot 찾기
-- `batch ∈ {1, 8, 32, 128}` — 높은 batch 에서 paged 가 진가
-- `context_len ∈ {128, 1024, 4096, 16384}`
+세 줄 요약:
+1. **MHA: SDPA 와 parity.** 실전 batch 에서 253 GB/s (L4 DRAM 피크의 85 %), 몇 케이스는 SDPA 보다 빠름 (-10 % gap).
+2. **GQA: 구조적으로 2×–13× 느림.** grid `(B, H_q)` 가 group 내 query heads 의 K/V DRAM 재로딩을 유발. gap 이 `GQA_GROUP_SIZE` 에 정확히 비례 (group=8 → +117 %, group=32 → +1316 %).
+3. **Block size sweet spot**: bs=128 이 safest default, bs=8 은 항상 최악, bs=16 은 MHA 에만 좋음.
 
-**ncu 드릴 (Lesson 10 툴체인 재사용)**
-- stall reason: indirection 때문에 long_scoreboard 가 늘었나?
-- register pressure: 포인터 연산이 regs 를 더 먹는가?
-- L1/L2 hit: block_table load 가 캐시 친화적인가?
+**스윕 커버리지**
+- `block_size ∈ {8, 16, 32, 64, 128}` ✅
+- `batch ∈ {1, 4, 8, 16, 32}` ✅
+- `context_len ∈ {1024, 2048, 4096, 8192}` ✅
+- `(H, H_kv) ∈ {(32,32) MHA, (32,8) LLaMA-3-8B, (64,8) LLaMA-70B, (32,1) MQA}` ✅
 
-**acceptance**
-- 벤치 테이블 + 3-줄 결론 (어느 조건에서 paged 가 이득/손해)
-- ncu diff: contiguous vs paged 의 stall 분포 비교
+**ncu 드릴** — TODO (가설: GQA gap 은 DRAM read volume × GQA_GROUP_SIZE 로 나타남)
+
+**acceptance** ✅
+- 벤치 테이블 + 3-줄 결론 ✅
+- GQA gap 의 근본 원인 식별 → Phase 4 (vLLM 소스 읽기) 에서 실제 해결책 비교 예정
 
 ---
 
