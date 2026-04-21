@@ -103,27 +103,31 @@ def paged_attention_ref(
     context_lens: torch.Tensor,
     scale: float | None = None,
 ) -> torch.Tensor:
-    """PyTorch reference for decode-mode paged attention (MHA).
+    """PyTorch reference for decode-mode paged attention (MHA or GQA).
 
     For each sequence, gathers all valid K/V tokens from the paged cache
     back into contiguous form, then runs standard scaled dot-product
     attention. O(B * ctx_len) memory allocations — slow but obviously
     correct.
 
+    GQA: if H_q != H_kv, we require H_q % H_kv == 0 and repeat-interleave
+    K/V along the head axis so each query head attends to its KV group.
+
     Args:
-        Q: (B, H, d). Single query per sequence (decode step).
-        K_cache, V_cache: (num_blocks_total, block_size, H, d).
+        Q: (B, H_q, d). Single query per sequence (decode step).
+        K_cache, V_cache: (num_blocks_total, block_size, H_kv, d).
         block_table: (B, max_blocks_per_seq) int32.
         context_lens: (B,) int32.
         scale: softmax scale. Default 1/sqrt(d).
 
     Returns:
-        (B, H, d) attention output.
+        (B, H_q, d) attention output.
     """
-    B, H, d = Q.shape
+    B, H_q, d = Q.shape
     num_blocks, block_size, H_kv, d_kv = K_cache.shape
-    assert H == H_kv, f"MHA only in Phase 0: H={H} H_kv={H_kv}"
+    assert H_q % H_kv == 0, f"H_q={H_q} must be divisible by H_kv={H_kv}"
     assert d == d_kv
+    gqa_group_size = H_q // H_kv
 
     if scale is None:
         scale = 1.0 / (d ** 0.5)
@@ -145,20 +149,22 @@ def paged_attention_ref(
             tok_start = logical_blk * block_size
             tok_end = min(tok_start + block_size, ctx_len)
             valid = tok_end - tok_start
-            k_pieces.append(K_cache[phys_blk, :valid])  # (valid, H, d)
+            k_pieces.append(K_cache[phys_blk, :valid])  # (valid, H_kv, d)
             v_pieces.append(V_cache[phys_blk, :valid])
 
-        K_full = torch.cat(k_pieces, dim=0)   # (ctx_len, H, d)
+        K_full = torch.cat(k_pieces, dim=0)   # (ctx_len, H_kv, d)
         V_full = torch.cat(v_pieces, dim=0)
 
-        # Attention: per-head scaled dot product.
-        # Q[b]: (H, d), K_full.permute(1, 0, 2): (H, ctx_len, d)
-        q = Q[b]                             # (H, d)
-        k = K_full.permute(1, 0, 2)          # (H, ctx_len, d)
-        v = V_full.permute(1, 0, 2)          # (H, ctx_len, d)
+        # Per-head scaled dot product; expand KV heads for GQA.
+        q = Q[b]                                       # (H_q, d)
+        k = K_full.permute(1, 0, 2)                    # (H_kv, ctx_len, d)
+        v = V_full.permute(1, 0, 2)                    # (H_kv, ctx_len, d)
+        if gqa_group_size != 1:
+            k = k.repeat_interleave(gqa_group_size, dim=0)  # (H_q, ctx_len, d)
+            v = v.repeat_interleave(gqa_group_size, dim=0)
 
         scores = torch.einsum("hd,hnd->hn", q, k).float() * scale   # fp32 for stability
-        probs = torch.softmax(scores, dim=-1).to(v.dtype)           # (H, ctx_len)
+        probs = torch.softmax(scores, dim=-1).to(v.dtype)           # (H_q, ctx_len)
         out[b] = torch.einsum("hn,hnd->hd", probs, v)
 
     return out
@@ -171,24 +177,35 @@ def naive_decode_attention(
     context_lens: torch.Tensor | None = None,
     scale: float | None = None,
 ) -> torch.Tensor:
-    """Standard (non-paged) decode attention reference.
+    """Standard (non-paged) decode attention reference. MHA or GQA.
 
     Used as the "known-good" output that paged_attention_ref must match.
 
+    GQA: if Q has H_q heads and K/V have H_kv heads with H_q > H_kv,
+    we repeat-interleave K/V along the head axis by H_q / H_kv.
+
     Args:
-        Q: (B, H, d).
-        K, V: (B, H, N, d).
+        Q: (B, H_q, d).
+        K, V: (B, H_kv, N, d).
         context_lens: (B,) int. If given, mask tokens beyond context_lens[b].
         scale: default 1/sqrt(d).
 
     Returns:
-        (B, H, d).
+        (B, H_q, d).
     """
-    B, H, N, d = K.shape
+    B_q, H_q, d_q = Q.shape
+    B, H_kv, N, d = K.shape
+    assert B == B_q and d == d_q
+    assert H_q % H_kv == 0, f"H_q={H_q} must be divisible by H_kv={H_kv}"
+    gqa_group_size = H_q // H_kv
     if scale is None:
         scale = 1.0 / (d ** 0.5)
 
-    # scores: (B, H, N) = einsum over d
+    if gqa_group_size != 1:
+        K = K.repeat_interleave(gqa_group_size, dim=1)   # (B, H_q, N, d)
+        V = V.repeat_interleave(gqa_group_size, dim=1)
+
+    # scores: (B, H_q, N) = einsum over d
     scores = torch.einsum("bhd,bhnd->bhn", Q, K).float() * scale
 
     if context_lens is not None:
@@ -197,5 +214,5 @@ def naive_decode_attention(
         mask = token_idx[None, :] < context_lens.to(Q.device)[:, None]   # (B, N)
         scores = scores.masked_fill(~mask[:, None, :], float("-inf"))
 
-    probs = torch.softmax(scores, dim=-1).to(V.dtype)   # (B, H, N)
+    probs = torch.softmax(scores, dim=-1).to(V.dtype)   # (B, H_q, N)
     return torch.einsum("bhn,bhnd->bhd", probs, V)

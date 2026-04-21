@@ -34,6 +34,7 @@ from triton_kernels.paged_attention_ref import (  # noqa: E402
 # -----------------------------------------------------------------------------
 
 CASES = [
+    # --- MHA ---
     # Smallest — single seq, single head, two full blocks.
     dict(B=1, H=1, d=64,  context_lens=[32], block_size=16),
     # Partial last block (30 tokens in two 16-blocks = 16 full + 14 partial).
@@ -50,7 +51,15 @@ CASES = [
     dict(B=2, H=32, d=128, context_lens=[513, 129], block_size=16),
     # Single token context (edge — new seq with only the prefill token).
     dict(B=2, H=4, d=64,  context_lens=[1, 5], block_size=16),
-    # Non-power-of-2 head dim? Skip — real models always use powers of 2.
+    # --- GQA ---
+    # Smallest GQA: group size 2 (Mistral).
+    dict(B=1, H=4,  H_kv=2, d=64,  context_lens=[48], block_size=16),
+    # LLaMA-3-8B-ish: H=32 H_kv=8 (group=4).
+    dict(B=2, H=32, H_kv=8, d=128, context_lens=[513, 129], block_size=16),
+    # LLaMA-70B-ish: H=64 H_kv=8 (group=8).
+    dict(B=2, H=64, H_kv=8, d=128, context_lens=[256, 777], block_size=16),
+    # MQA (group=H) — one KV head shared by all query heads.
+    dict(B=2, H=16, H_kv=1, d=64,  context_lens=[128, 64], block_size=16),
 ]
 
 
@@ -58,6 +67,7 @@ def run_one_case(case: dict, seed: int = 0, dtype: torch.dtype = torch.float32):
     torch.manual_seed(seed)
     B = case["B"]
     H = case["H"]
+    H_kv = case.get("H_kv", H)
     d = case["d"]
     block_size = case["block_size"]
     context_lens_py = case["context_lens"]
@@ -67,9 +77,9 @@ def run_one_case(case: dict, seed: int = 0, dtype: torch.dtype = torch.float32):
 
     # Random Q and K/V of maximum length. We'll only read up to context_lens[b]
     # in each sequence; tokens past that are ignored by both references.
-    Q = torch.randn(B, H, d, dtype=dtype, device=device)
-    K = torch.randn(B, H, N_max, d, dtype=dtype, device=device)
-    V = torch.randn(B, H, N_max, d, dtype=dtype, device=device)
+    Q = torch.randn(B, H,    d,     dtype=dtype, device=device)
+    K = torch.randn(B, H_kv, N_max, d, dtype=dtype, device=device)
+    V = torch.randn(B, H_kv, N_max, d, dtype=dtype, device=device)
     context_lens = torch.tensor(context_lens_py, dtype=torch.int32, device=device)
 
     scale = 1.0 / (d ** 0.5)
@@ -109,9 +119,12 @@ def main():
     for i, case in enumerate(CASES):
         r = run_one_case(case)
         status = "PASS" if r["ok"] else "FAIL"
+        H_kv = case.get("H_kv", case["H"])
+        gqa_tag = f"(kv={H_kv})" if H_kv != case["H"] else ""
         print(
-            f"[{status}] case {i:2d}: B={case['B']} H={case['H']} d={case['d']:3d} "
-            f"ctx={case['context_lens']} block={case['block_size']:3d}  "
+            f"[{status}] case {i:2d}: B={case['B']} H={case['H']}{gqa_tag} "
+            f"d={case['d']:3d} ctx={case['context_lens']} "
+            f"block={case['block_size']:3d}  "
             f"abs_diff={r['max_abs_diff']:.2e}  rel_diff={r['max_rel_diff']:.2e}"
         )
         if not r["ok"]:
