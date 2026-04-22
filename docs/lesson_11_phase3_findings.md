@@ -8,9 +8,14 @@
 Baseline = `torch.nn.functional.scaled_dot_product_attention(..., enable_gqa=True)`
 — the dispatcher picks cuDNN / FA-2 / aten.
 
+> **Phase 3 → Phase 3.5**: Phase 3 identified the GQA gap; Phase 3.5
+> refactored the kernel grid to fix it. Phase 3 numbers are kept below
+> (Signatures 1–2) so the regression vs. the fix is visible. Jump to
+> **Phase 3.5** at the bottom for the after-fix results.
+
 ---
 
-## Headline
+## Headline (Phase 3, pre-fix)
 
 **MHA: parity with SDPA.** Our paged kernel matches or beats SDPA at
 realistic batch sizes, peaking at **253 GB/s** (≈ 85 % of L4 DRAM peak).
@@ -19,7 +24,7 @@ realistic batch sizes, peaking at **253 GB/s** (≈ 85 % of L4 DRAM peak).
 `(B, H_q)` grid launching one program per query head, so the
 `GQA_GROUP_SIZE` query heads in a KV group each independently reload the
 **same** KV blocks. vLLM's actual kernel launches `(B, H_kv)` and
-broadcasts Q inside the kernel — that's the fix for Phase 4.
+broadcasts Q inside the kernel — the fix for Phase 3.5.
 
 ---
 
@@ -102,10 +107,127 @@ up (group × state), so tl.dot may need `BLOCK_M = GROUP_SIZE` with padding.
 
 ---
 
-## Conclusion (three lines)
+## Conclusion (three lines, pre-fix)
 
 1. **MHA is shipped.** Our kernel ≈ SDPA at realistic batch, 253 GB/s peak.
 2. **GQA needs a grid restructure.** Launch per `(B, H_kv)`, broadcast Q
    across the group inside the kernel. Same fix vLLM already did.
 3. **Default block_size = 128 on L4** unless the shape is short-ctx B=1
    (then launch overhead is the bottleneck; block_size is irrelevant).
+
+---
+
+# Phase 3.5 — Grid restructure (the fix)
+
+**Date**: 2026-04-22 (same session)
+**What changed**: `grid = (B, H_q)` → `grid = (B, H_kv)`. Each program
+now handles `GQA_GROUP_SIZE` query heads at once, loads K/V blocks
+**once**, and runs `GROUP_SIZE` parallel online-softmax accumulators.
+
+Score and PV paths use `tl.dot` when `GROUP ≥ 4 and BLOCK ≥ 16` (fp16 MMA
+on sm_89); everything else falls back to manual broadcast in fp32.
+fp32 inputs on the `tl.dot` path use `input_precision="ieee"` to dodge
+TF32's 10-bit mantissa, which was silently injecting ~4e-4 error on MQA
+softmax edge cases.
+
+Correctness: **32 / 32 PASS** on the Phase 1 + 2 bench (fp16 and fp32,
+MHA + GQA + MQA). Max diffs within tolerance:
+- fp16: 9.8e-04 (scale-bound by dtype precision)
+- fp32: 3.6e-07 (IEEE path — down from 4.1e-04 with default TF32)
+
+---
+
+## Phase 3.5 results (fp16, warmup=50, iters=200)
+
+```
+| shape               | B  | H  | H_kv | grp | ctx  | SDPA ms | paged ms | best bs | gap    |
+|---------------------|----|----|------|-----|------|---------|----------|---------|--------|
+| llama7b-B1-ctx1k    | 1  | 32 | 32   |  1  | 1024 | 0.075   | 0.162    | 32      | +115%  |
+| llama7b-B1-ctx4k    | 1  | 32 | 32   |  1  | 4096 | 0.583   | 0.348    | 64      |  -40%  |
+| llama7b-B8-ctx2k    | 8  | 32 | 32   |  1  | 2048 | 1.322   | 1.227    | 16      |  -7%   |
+| llama7b-B32-ctx2k   | 32 | 32 | 32   |  1  | 2048 | 4.885   | 5.014    | 64      |  +3%   |
+| llama7b-B8-ctx8k    | 8  | 32 | 32   |  1  | 8192 | 6.115   | 4.927    | 64      |  -19%  |
+| llama38b-B8-ctx2k   | 8  | 32 |  8   |  4  | 2048 | 0.308   | 0.264    | 16      |  -14%  |
+| llama38b-B32-ctx2k  | 32 | 32 |  8   |  4  | 2048 | 1.163   | 1.197    | 128     |  +3%   |
+| llama70b-B4-ctx2k   | 4  | 64 |  8   |  8  | 2048 | 0.049   | 0.048    | 128     |  -1%   |
+| llama70b-B8-ctx4k   | 8  | 64 |  8   |  8  | 4096 | 0.532   | 0.526    | 16      |  -1%   |
+| mqa-B16-ctx4k       | 16 | 32 |  1   | 32  | 4096 | 0.048   | 0.089    | 128     |  +85%  |
+```
+
+`grp` = `GQA_GROUP_SIZE` = `H_q / H_kv`. Positive gap = paged slower than SDPA.
+
+---
+
+## Before / after on GQA (the point of this phase)
+
+```
+                        Phase 3 gap   Phase 3.5 gap    Δ
+llama38b-B8-ctx2k       +161%         -14%             (226% better, beats SDPA)
+llama38b-B32-ctx2k       +86%          +3%             (83% better, parity)
+llama70b-B4-ctx2k         -2%          -1%             (already won; unchanged)
+llama70b-B8-ctx4k         -1%          -1%             (already won; unchanged)
+mqa-B16-ctx4k          +1316%         +85%             (1231% better, still above SDPA)
+```
+
+The LLaMA-70B shapes were already at parity in Phase 3 because their
+`BLOCK × HEAD` intermediate was small enough that the redundant DRAM
+traffic fit in L2. The Phase 3.5 refactor makes this win deterministic
+rather than lucky.
+
+LLaMA-3-8B (group=4) was the big fish: **+161% → −14%**. The kernel is
+now faster than cuDNN/FA-2 at this realistic shape.
+
+---
+
+## Signature 4 — the residual MQA gap is L2 reuse, not grid parallelism
+
+MQA still shows +85% vs SDPA. SDPA achieves **698 GB/s** on this shape
+— 2.3× the L4 DRAM peak. That throughput is only possible if L2 is
+absorbing the repeated K/V reads (1 KV head × 4k tokens × 128 dim × 2 B
+fp16 = 1 MB; the 32 query heads all share that 1 MB → fits in L2 48 MB
+with massive reuse).
+
+Our paged kernel can't replicate this with the block_table layout: each
+`(num_blocks, block_size, H_kv, d)` block is at a different physical
+offset, so the L2 prefetcher that works for contiguous SDPA reads
+doesn't pattern-match for us. This is **structural**, not a grid issue.
+Fixing it would require either:
+
+1. Physically co-locating blocks for a sequence (defeats paging);
+2. Issuing hint loads with `tl.device_assume` /
+   `cp.async.cg` (not exposed in Triton 3.6); or
+3. Splitting across the ctx dim so multiple programs tile the same KV
+   block in parallel, keeping that block hot in L2 (the vLLM V2 split-k
+   approach).
+
+Option 3 is what vLLM's `paged_attention_v2.cu` does, with
+exponential-sum reduction across the split. That's a Phase 5 topic.
+
+---
+
+## Signature 5 — `tl.dot` threshold matters
+
+First pass set the threshold at GROUP ≥ 8 (the minimum for fp16 MMA).
+That left GROUP=4 (LLaMA-3-8B) on the manual-broadcast fallback, which
+materializes a `(GROUP, BLOCK, HEAD) = (4, 16, 128)` fp32 tile = 32 KB
+in SMEM per iteration — enough to cap occupancy on L4.
+
+Lowering the threshold to GROUP ≥ 4 let LLaMA-3-8B take the MMA path,
+dropping the gap from +85% to +3% at B=32 and from +161% to −14% at B=8.
+
+For GROUP=1 (MHA) and GROUP=2 (Mistral), the `(GROUP, BLOCK) = (1, 16)`
+or `(2, 16)` tile is too small to saturate MMA, and the manual broadcast
+fallback stays competitive.
+
+---
+
+## Phase 3.5 conclusion (three lines)
+
+1. **GQA is shipped too.** Grid-by-KV-head closes the LLaMA-3-8B gap
+   from +161% to −14%; LLaMA-70B stays at parity. Measurable.
+2. **MQA gap is residual L2 reuse.** A Phase 5 split-k across ctx would
+   close it; the grid change alone can't.
+3. **The failure mode was quietly two bugs**: grid design (DRAM waste)
+   and silent TF32 precision in `tl.dot` (4e-4 error on fp32 MQA). Both
+   needed to be fixed to ship — only one of them showed up in Phase 3's
+   signature.

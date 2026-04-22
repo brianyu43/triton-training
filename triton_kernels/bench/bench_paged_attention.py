@@ -132,11 +132,20 @@ def main():
         print("CUDA not available — Phase 1 requires GPU. Run on the GCP L4 VM.")
         return 1
 
+    # Disable TF32 for the torch references (naive + paged einsum). Our
+    # Triton kernel is already IEEE-accurate on fp32 (it uses
+    # `input_precision="ieee"` on the tl.dot paths, and manual fp32
+    # broadcast elsewhere), so any TF32 on the reference side would show
+    # up as a spurious diff on MQA / large-GROUP softmax edges.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
     device = "cuda"
     gpu_name = torch.cuda.get_device_name(0)
     cc = torch.cuda.get_device_capability(0)
     print(f"GPU: {gpu_name}  (sm_{cc[0]}{cc[1]})")
     print(f"torch {torch.__version__}")
+    print(f"matmul tf32 enabled: {torch.backends.cuda.matmul.allow_tf32}")
 
     import triton
     print(f"triton {triton.__version__}")
