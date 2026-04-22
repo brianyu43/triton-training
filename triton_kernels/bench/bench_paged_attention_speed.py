@@ -1,18 +1,22 @@
 """
-Lesson 11 · Phase 3 — Paged attention speed bench.
+Lesson 11 · Phase 3 + Lesson 12 · split-k — Paged attention speed bench.
 
 Apples-to-apples: for each (B, H, H_kv, d, ctx_len) shape, time
   - (A) torch.nn.functional.scaled_dot_product_attention with enable_gqa=True
         (contiguous KV — the optimistic baseline; cuDNN / FA-2 / aten pick)
-  - (B) our triton_paged_attention_decode at each block_size in the sweep
+  - (B) our triton_paged_attention_decode at each block_size in the sweep,
+        via the auto-dispatch path (single-pass when grid saturates L4,
+        split-k when it doesn't).
 
-Goal: quantify the overhead of block_table indirection on a realistic
-decode workload, and find the block_size sweet spot on L4.
+With --compare-paths, we additionally run block_size=16 three times:
+single-pass (force off), split-k (force on), and auto. The MQA/low-batch
+shapes are the ones expected to benefit from split-k.
 
-Output: markdown table printed to stdout. Run on the L4 spot VM.
+Output: markdown table + summary to stdout. Run on the L4 spot VM.
 
 Run:
     python3 triton_kernels/bench/bench_paged_attention_speed.py
+    python3 triton_kernels/bench/bench_paged_attention_speed.py --compare-paths
 """
 
 from __future__ import annotations
@@ -122,7 +126,7 @@ def run_shape(name: str, B: int, H: int, H_kv: int, d: int, ctx: int,
         sdpa_gbs = float("nan")
         print(f"  [warn] SDPA failed on {name}: {type(e).__name__}: {e}")
 
-    # (B) Our paged kernel at each block_size.
+    # (B) Our paged kernel at each block_size (auto-dispatch path).
     paged_results = {}
     for bs in BLOCK_SIZES:
         # Pack K/V fresh per block_size.
@@ -130,7 +134,7 @@ def run_shape(name: str, B: int, H: int, H_kv: int, d: int, ctx: int,
 
         def run_paged():
             return triton_paged_attention_decode(
-                Q, K_cache, V_cache, block_table, ctx_t, scale=scale
+                Q, K_cache, V_cache, block_table, ctx_t, scale=scale,
             )
 
         try:
@@ -146,6 +150,64 @@ def run_shape(name: str, B: int, H: int, H_kv: int, d: int, ctx: int,
         "name": name, "B": B, "H": H, "H_kv": H_kv, "d": d, "ctx": ctx,
         "sdpa_ms": sdpa_ms, "sdpa_gbs": sdpa_gbs,
         "paged": paged_results,
+    }
+
+
+def run_path_compare(name: str, B: int, H: int, H_kv: int, d: int, ctx: int,
+                     dtype: torch.dtype, device: str, warmup: int, iters: int,
+                     block_size: int = 16, partition_size: int = 512):
+    """Compare single-pass / split-k / auto paths at one block_size.
+
+    Prints three rows per shape. Expected: MQA and low-batch shapes show
+    split-k > single-pass; large-grid shapes show split-k ~ single-pass
+    (or slightly worse due to extra kernel launch).
+    """
+    Q, K, V, ctx_t = make_inputs(B, H, H_kv, d, ctx, dtype, device)
+    scale = 1.0 / (d ** 0.5)
+    K_cache, V_cache, block_table, _ = pack_kv_paged(K, V, block_size, ctx_t)
+
+    Q4 = Q.unsqueeze(2)
+
+    def run_sdpa():
+        if H_kv == H:
+            return F.scaled_dot_product_attention(
+                Q4, K, V, is_causal=False, scale=scale
+            )
+        return F.scaled_dot_product_attention(
+            Q4, K, V, is_causal=False, scale=scale, enable_gqa=True
+        )
+
+    try:
+        sdpa_ms = timed(run_sdpa, warmup, iters)
+    except Exception:
+        sdpa_ms = float("nan")
+
+    results = {}
+    for mode, use_split_k in [
+        ("single-pass", False),
+        ("split-k",     True),
+        ("auto",        None),
+    ]:
+        def run_paged(use_split_k=use_split_k):
+            return triton_paged_attention_decode(
+                Q, K_cache, V_cache, block_table, ctx_t, scale=scale,
+                use_split_k=use_split_k,
+                partition_size=partition_size,
+            )
+
+        try:
+            ms = timed(run_paged, warmup, iters)
+            gap = (ms - sdpa_ms) / sdpa_ms * 100 if sdpa_ms == sdpa_ms else float("nan")
+            results[mode] = (ms, gap)
+        except Exception as e:
+            results[mode] = (float("nan"), float("nan"))
+            print(f"  [warn] paged {mode} failed: {type(e).__name__}: {e}")
+
+    return {
+        "name": name, "B": B, "H": H, "H_kv": H_kv, "d": d, "ctx": ctx,
+        "block_size": block_size, "partition_size": partition_size,
+        "sdpa_ms": sdpa_ms,
+        "by_path": results,
     }
 
 
@@ -195,12 +257,43 @@ def print_summary(results: List[dict]):
         print(l)
 
 
+def print_path_compare(compare_results):
+    print()
+    print("## Path comparison (block_size=16, partition_size=512)")
+    print()
+    print("| shape | B | H | H_kv | ctx | SDPA ms "
+          "| SP ms | SP gap | SK ms | SK gap | auto ms | auto gap | SK vs SP |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    for r in compare_results:
+        sp_ms, sp_gap = r["by_path"]["single-pass"]
+        sk_ms, sk_gap = r["by_path"]["split-k"]
+        au_ms, au_gap = r["by_path"]["auto"]
+        sk_vs_sp = (sp_ms - sk_ms) / sp_ms * 100 if sp_ms == sp_ms and sp_ms > 0 else float("nan")
+        print(
+            f"| {r['name']} | {r['B']} | {r['H']} | {r['H_kv']} | {r['ctx']} "
+            f"| {r['sdpa_ms']:.3f} "
+            f"| {sp_ms:.3f} | {sp_gap:+.1f}% "
+            f"| {sk_ms:.3f} | {sk_gap:+.1f}% "
+            f"| {au_ms:.3f} | {au_gap:+.1f}% "
+            f"| {sk_vs_sp:+.1f}% |"
+        )
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dtype", choices=["fp16", "fp32"], default="fp16")
     p.add_argument("--warmup", type=int, default=50)
     p.add_argument("--iters", type=int, default=200)
+    p.add_argument("--compare-paths", action="store_true",
+                   help="After the block_size sweep, run an extra pass at "
+                        "block_size=16 forcing each of single-pass / split-k "
+                        "/ auto and print the gap vs SDPA for each path.")
+    p.add_argument("--skip-sweep", action="store_true",
+                   help="Skip the block_size sweep (only run path compare). "
+                        "Implies --compare-paths.")
     args = p.parse_args()
+    if args.skip_sweep:
+        args.compare_paths = True
 
     if not torch.cuda.is_available():
         print("CUDA not available — phase 3 needs GPU.")
@@ -218,25 +311,46 @@ def main():
     print(f"block_sizes swept: {BLOCK_SIZES}")
 
     results = []
-    for shape in SHAPES:
-        name, B, H, H_kv, d, ctx = shape
-        print(f"\n--- {name}: B={B} H={H} H_kv={H_kv} d={d} ctx={ctx} ---")
-        r = run_shape(name, B, H, H_kv, d, ctx, dtype, device,
-                      args.warmup, args.iters)
-        results.append(r)
-        # Print one-line summary inline so the terminal shows progress.
-        best_bs = None
-        best_ms = float("inf")
-        for bs, (ms, _, _) in r["paged"].items():
-            if ms == ms and ms < best_ms:
-                best_ms = ms
-                best_bs = bs
-        print(f"  SDPA {r['sdpa_ms']:.3f} ms ({r['sdpa_gbs']:.1f} GB/s)  "
-              f"best paged bs={best_bs} {best_ms:.3f} ms  "
-              f"gap {(best_ms - r['sdpa_ms']) / r['sdpa_ms'] * 100:+.1f}%")
+    if not args.skip_sweep:
+        for shape in SHAPES:
+            name, B, H, H_kv, d, ctx = shape
+            print(f"\n--- {name}: B={B} H={H} H_kv={H_kv} d={d} ctx={ctx} ---")
+            r = run_shape(name, B, H, H_kv, d, ctx, dtype, device,
+                          args.warmup, args.iters)
+            results.append(r)
+            # Print one-line summary inline so the terminal shows progress.
+            best_bs = None
+            best_ms = float("inf")
+            for bs, (ms, _, _) in r["paged"].items():
+                if ms == ms and ms < best_ms:
+                    best_ms = ms
+                    best_bs = bs
+            print(f"  SDPA {r['sdpa_ms']:.3f} ms ({r['sdpa_gbs']:.1f} GB/s)  "
+                  f"best paged bs={best_bs} {best_ms:.3f} ms  "
+                  f"gap {(best_ms - r['sdpa_ms']) / r['sdpa_ms'] * 100:+.1f}%")
 
-    print_markdown(results)
-    print_summary(results)
+        print_markdown(results)
+        print_summary(results)
+
+    if args.compare_paths:
+        print("\n" + "=" * 88)
+        print("Lesson 12 · path comparison")
+        compare_results = []
+        for shape in SHAPES:
+            name, B, H, H_kv, d, ctx = shape
+            print(f"\n--- {name}: B={B} H={H} H_kv={H_kv} d={d} ctx={ctx} ---")
+            r = run_path_compare(name, B, H, H_kv, d, ctx, dtype, device,
+                                 args.warmup, args.iters,
+                                 block_size=16, partition_size=512)
+            compare_results.append(r)
+            sp_ms, sp_gap = r["by_path"]["single-pass"]
+            sk_ms, sk_gap = r["by_path"]["split-k"]
+            au_ms, au_gap = r["by_path"]["auto"]
+            print(f"  SDPA {r['sdpa_ms']:.3f} ms | "
+                  f"SP {sp_ms:.3f} ms ({sp_gap:+.1f}%) | "
+                  f"SK {sk_ms:.3f} ms ({sk_gap:+.1f}%) | "
+                  f"auto {au_ms:.3f} ms ({au_gap:+.1f}%)")
+        print_path_compare(compare_results)
     return 0
 
 

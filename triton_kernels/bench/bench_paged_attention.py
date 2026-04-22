@@ -1,8 +1,10 @@
 """
-Lesson 11 · Phase 1+2 correctness — Triton paged attention vs references.
+Lesson 11 · Phase 1+2 + Lesson 12 correctness —
+Triton paged attention vs references, single-pass + split-k paths.
 
 Covers MHA (Phase 1) and GQA / MQA (Phase 2: H_q % H_kv == 0 with
-H_kv < H_q, LLaMA-3-8B / LLaMA-70B / MQA).
+H_kv < H_q, LLaMA-3-8B / LLaMA-70B / MQA) and lesson 12's split-k
+path (ctx-axis splits + reduce kernel).
 
 Requires CUDA + Triton. Runs on the GCP L4 spot VM (or any sm_89).
 
@@ -10,10 +12,12 @@ For each test shape:
     1. Generate random contiguous (B, H_q, d) Q and (B, H_kv, N, d) K/V.
     2. Pack K/V into paged layout via pack_kv_paged().
     3. Run:
-         a) naive_decode_attention (contiguous, ground truth)
-         b) paged_attention_ref    (paged reference, fp32 math)
-         c) triton_paged_attention_decode (our Triton kernel)
-    4. Verify (c) matches (a) and (b) within fp16/fp32 tolerance.
+         a) naive_decode_attention        (contiguous, ground truth)
+         b) paged_attention_ref           (paged reference, fp32 math)
+         c) triton_paged_attention_decode (single-pass,  auto-dispatch off)
+         d) triton_paged_attention_decode (split-k,     forced on)
+            — only when ctx_max is big enough to yield >=2 segments.
+    4. Verify (c) and (d) both match (a) and (b) within tolerance.
 
 Run:
     python3 triton_kernels/bench/bench_paged_attention.py
@@ -100,9 +104,29 @@ def run_one_case(case: dict, dtype: torch.dtype, device: str, seed: int = 0):
         block_table, ctx, scale=scale
     ).to(dtype)
 
-    # Triton kernel (runs in native dtype).
-    out_triton = triton_paged_attention_decode(
-        Q, K_cache, V_cache, block_table, ctx, scale=scale
+    # Triton — single-pass (force off).
+    out_sp = triton_paged_attention_decode(
+        Q, K_cache, V_cache, block_table, ctx, scale=scale,
+        use_split_k=False,
+    )
+
+    # Triton — split-k (force on), using a small partition_size so more
+    # shapes actually get split. Pick a partition that divides the current
+    # block_size and is <= ctx_max (else the wrapper auto-downgrades).
+    ctx_max = int(ctx.max().item())
+    # partition_size must be a multiple of block_size. Smallest useful is
+    # 2 * block_size so the ctx produces >= 2 segments when possible.
+    partition_size = max(block_size * 2, 32)
+    # Round up to a power of 2 and clamp into [block_size*2, 512].
+    partition_size = min(512, max(block_size * 2, partition_size))
+    # If ctx_max is smaller than 2*partition_size, split-k degenerates to 1
+    # segment and the wrapper falls back to single-pass. That's still
+    # correct; we'll report it as "(=SP)" for clarity.
+    segments_sk = max(1, (ctx_max + partition_size - 1) // partition_size)
+    out_sk = triton_paged_attention_decode(
+        Q, K_cache, V_cache, block_table, ctx, scale=scale,
+        use_split_k=True,
+        partition_size=partition_size,
     )
 
     # Tolerances: fp16 is sloppy at softmax edge cases, so allow 1e-2 abs.
@@ -113,16 +137,22 @@ def run_one_case(case: dict, dtype: torch.dtype, device: str, seed: int = 0):
     else:
         atol, rtol = 1e-4, 1e-4
 
-    diff_t_vs_naive  = (out_triton.float() - out_naive.float()).abs().max().item()
-    diff_t_vs_ref    = (out_triton.float() - out_ref.float()).abs().max().item()
-    diff_ref_vs_naive = (out_ref.float() - out_naive.float()).abs().max().item()
+    diff_sp_vs_naive  = (out_sp.float() - out_naive.float()).abs().max().item()
+    diff_sk_vs_naive  = (out_sk.float() - out_naive.float()).abs().max().item()
+    diff_sp_vs_ref    = (out_sp.float() - out_ref.float()).abs().max().item()
+    diff_sk_vs_sp     = (out_sk.float() - out_sp.float()).abs().max().item()
 
-    ok = torch.allclose(out_triton, out_naive, rtol=rtol, atol=atol)
+    ok_sp = torch.allclose(out_sp, out_naive, rtol=rtol, atol=atol)
+    ok_sk = torch.allclose(out_sk, out_naive, rtol=rtol, atol=atol)
     return {
-        "ok": ok,
-        "diff_t_vs_naive": diff_t_vs_naive,
-        "diff_t_vs_ref": diff_t_vs_ref,
-        "diff_ref_vs_naive": diff_ref_vs_naive,
+        "ok_sp": ok_sp,
+        "ok_sk": ok_sk,
+        "diff_sp_vs_naive": diff_sp_vs_naive,
+        "diff_sk_vs_naive": diff_sk_vs_naive,
+        "diff_sp_vs_ref": diff_sp_vs_ref,
+        "diff_sk_vs_sp": diff_sk_vs_sp,
+        "segments_sk": segments_sk,
+        "partition_size": partition_size,
         "case": case,
     }
 
@@ -152,38 +182,60 @@ def main():
     print("=" * 88)
 
     all_pass = True
+    n_sp_pass = 0
+    n_sk_pass = 0
+    n_sk_active = 0  # count of cases where split-k actually split (>=2 segments)
+    n_total = 0
     for dtype in (torch.float16, torch.float32):
         print(f"\n--- dtype: {dtype} ---")
         for i, case in enumerate(CASES):
+            n_total += 1
             try:
                 r = run_one_case(case, dtype=dtype, device=device)
             except Exception as e:
                 print(f"[ERR ] case {i:2d}: {case}   -> {type(e).__name__}: {e}")
                 all_pass = False
                 continue
-            status = "PASS" if r["ok"] else "FAIL"
+            ok_sp, ok_sk = r["ok_sp"], r["ok_sk"]
+            if ok_sp:
+                n_sp_pass += 1
+            if ok_sk:
+                n_sk_pass += 1
+            segs = r["segments_sk"]
+            if segs >= 2:
+                n_sk_active += 1
+            status_sp = "PASS" if ok_sp else "FAIL"
+            status_sk = "PASS" if ok_sk else "FAIL"
+            seg_tag = f"seg={segs}" if segs >= 2 else "seg=1(=SP)"
             ctx_s = r["case"]["context_lens"]
             if len(ctx_s) > 4:
                 ctx_s = f"{ctx_s[:2]}..(len={len(ctx_s)})"
             H_kv_display = r["case"].get("H_kv", r["case"]["H"])
             gqa_tag = f"({H_kv_display})" if H_kv_display != r["case"]["H"] else "    "
             print(
-                f"[{status}] case {i:2d}: B={r['case']['B']:2d} "
-                f"H={r['case']['H']:2d}{gqa_tag} "
-                f"d={r['case']['d']:3d} ctx={ctx_s} blk={r['case']['block_size']:3d}  "
-                f"triton-naive={r['diff_t_vs_naive']:.2e}  "
-                f"triton-ref={r['diff_t_vs_ref']:.2e}"
+                f"[SP:{status_sp} SK:{status_sk}] case {i:2d}: "
+                f"B={r['case']['B']:2d} H={r['case']['H']:2d}{gqa_tag} "
+                f"d={r['case']['d']:3d} ctx={ctx_s} blk={r['case']['block_size']:3d} "
+                f"part={r['partition_size']:3d} {seg_tag:>9s}  "
+                f"sp-naive={r['diff_sp_vs_naive']:.2e}  "
+                f"sk-naive={r['diff_sk_vs_naive']:.2e}  "
+                f"sk-sp={r['diff_sk_vs_sp']:.2e}"
             )
-            if not r["ok"]:
+            if not (ok_sp and ok_sk):
                 all_pass = False
 
     print()
     print("=" * 88)
+    print(
+        f"single-pass: {n_sp_pass}/{n_total} PASS   "
+        f"split-k:     {n_sk_pass}/{n_total} PASS   "
+        f"(split-k actually split in {n_sk_active}/{n_total} cases)"
+    )
     if all_pass:
-        print("Phase 1 OK — Triton paged attention matches references.")
+        print("Lesson 11+12 OK — both Triton paths match references.")
         return 0
     else:
-        print("Phase 1 FAIL — see diffs above.")
+        print("FAIL — see diffs above.")
         return 1
 
 
