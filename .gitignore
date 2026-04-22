@@ -1,6 +1,7 @@
 bin/
 build/
 results/
+bench_results/
 *.o
 *.out
 *.csv
