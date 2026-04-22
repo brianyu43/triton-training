@@ -1,8 +1,10 @@
 # vLLM 의 Paged Attention V2 를 Triton 으로 — MQA 의 SM 점유율 구멍을 split-k 로 닫기
 
-_(Lesson 12 · 2026-04-22, 카프카-서명 서체 느낌)_
+*— "파라미터 스윕으로 안 닫히면 아키텍처를 의심해라" 의 한 번 더 되감기.*
 
-지난 편 ([vLLM 의 Paged Attention 을 Triton 으로 다시 짜보고, vLLM 의 실수를 반복했다](blog_draft_lesson_11_paged_attention.md)) 에서 가장 불편했던 결과는 한 줄로 이랬다.
+기준 날짜: 2026-04-22  ·  GPU: NVIDIA L4 (Ada Lovelace, sm_89, 24GB)  ·  torch 2.11.0+cu130 · Triton 3.6.0 · fp16/fp32
+
+지난 편 ([vLLM 의 Paged Attention 을 Triton 으로 다시 짜보고, vLLM 의 실수를 반복했다](./blog_draft_lesson_11_paged_attention.md)) 에서 가장 불편했던 결과는 한 줄로 이랬다.
 
 > MQA (B=16, H=32, H_kv=1, ctx=4k) 에서 우리 paged 커널이 SDPA 대비 **+85 %** 느리다 — 이건 구조적 결함이다.
 
@@ -184,3 +186,12 @@ bash scripts/gcp_run_lesson12.sh nemo-488500 <zone> <vm-name> all
 ```
 
 전체 소스: `triton_kernels/paged_attention.py` 의 `paged_attention_split_kernel` + `paged_attention_reduce_kernel` + `triton_paged_attention_decode` wrapper. ~480 줄.
+
+### 재료 링크
+
+- Lesson 12 핸드오프: [`docs/lesson_12_handoff_2026-04-22.md`](/Users/xavier/dev/cudatraining/docs/lesson_12_handoff_2026-04-22.md:1)
+- Lesson 11 (전편, single-pass paged): [`docs/blog_draft_lesson_11_paged_attention.md`](/Users/xavier/dev/cudatraining/docs/blog_draft_lesson_11_paged_attention.md:1)
+- Lesson 10 (프로파일링 툴체인): [`docs/blog_draft_lesson_10_profiling.md`](/Users/xavier/dev/cudatraining/docs/blog_draft_lesson_10_profiling.md:1)
+- Lesson 09 (contiguous MHA/FA, online softmax 원조): [`docs/blog_draft_lesson_09_mha_causal_fa.md`](/Users/xavier/dev/cudatraining/docs/blog_draft_lesson_09_mha_causal_fa.md:1)
+- vLLM v2 CUDA 원본: `csrc/attention/paged_attention_v2.cu` (HEAD `2463f00`)
+- vLLM 논문: Kwon et al., *Efficient Memory Management for Large Language Model Serving with PagedAttention*, SOSP 2023.

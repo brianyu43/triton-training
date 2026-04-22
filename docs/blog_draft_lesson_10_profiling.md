@@ -230,3 +230,4 @@ GCP DL image 에서 `ncu` 는 `sudo -E env PATH=$PATH ncu ...` 로 감싸야 per
 - Phase 2 summary: [`results/lesson10_phase2/summary.md`](/Users/xavier/dev/cudatraining/results/lesson10_phase2/summary.md:1)
 - Phase 3 summary: [`results/lesson10_phase3/summary.md`](/Users/xavier/dev/cudatraining/results/lesson10_phase3/summary.md:1)
 - 이전 레슨 08, 09 블로그: [`docs/blog_draft_triton_vs_cuda.md`](/Users/xavier/dev/cudatraining/docs/blog_draft_triton_vs_cuda.md:1), [`docs/blog_draft_lesson_09_mha_causal_fa.md`](/Users/xavier/dev/cudatraining/docs/blog_draft_lesson_09_mha_causal_fa.md:1)
+- 후속 레슨 11, 12 블로그 (이 세션의 SOL % / L2 / occupancy 해석 프레임이 실제 튜닝에 쓰인 첫 사례 — "속도 차이가 나면 DRAM / L2 / SM 점유율 중 어디에서 오나" 로 이어짐): [`docs/blog_draft_lesson_11_paged_attention.md`](/Users/xavier/dev/cudatraining/docs/blog_draft_lesson_11_paged_attention.md:1), [`docs/blog_draft_lesson_12_split_k.md`](/Users/xavier/dev/cudatraining/docs/blog_draft_lesson_12_split_k.md:1)
