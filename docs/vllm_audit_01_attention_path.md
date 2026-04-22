@@ -104,17 +104,98 @@ csrc/attention/
 
 ---
 
-## Day 2 target (다음 세션)
+---
 
-Day 1 의 질문 1-3 해결:
+## Day 2 — Triton kernels + selector + 두 개의 오해 수정
 
-- `selector.py` 165 줄 읽어서 dispatch rule 정리.
-- Triton 3 파일 (decode / prefill / unified) 각각의 kernel signature + 언제 호출되는지 확인.
-- `triton_merge_attn_states.py` 읽어서 **우리 lesson 12 reduce 와 구조 비교** — 같은가? 다른가? 다르면 어디가?
+### 오해 1 — `triton_merge_attn_states.py` 는 split-k reduce 가 **아님**
 
-**산출물**: 이 문서의 Day 2 섹션 추가 + 3 개의 Triton Python 파일을 **각각 50 줄씩 요약한 cheat sheet**.
+Day 1 추측: "이게 우리 lesson 12 reduce 와 같은 역할일 것 같다." → **틀림**.
 
-Week 1 전체 산출물은 이 문서의 §Day 5 에 끝나고, §Candidate 3 에서 Week 2 에 팔 한 개를 선정한다.
+읽어보니:
+- 정확히 **2-way merge** (prefix + suffix). N 개 segment 를 recombine 하는 게 아님.
+- arxiv:**2501.01005 §2.2** 를 구현 (파라미터 이름이 `prefix_lse`, `suffix_lse`).
+- 용도: **prefix caching**. 캐시에서 가져온 prefix 의 partial attention + 새 suffix 의 attention 을 합칠 때.
+- Grid `(num_tokens, num_query_heads)`, 토큰 단위 element-wise merge.
+- `prefill_tokens_with_context` boundary 로 **mixed batch** (context 있는 토큰 + 없는 토큰) 처리.
+
+완전히 다른 문제. 우리 split-k reduce 와는 구조도 용도도 다름.
+
+### 오해 2 — 우리가 찾던 split-k reduce 는 별도 파일이 아니라 unified 안에 있음
+
+실제 split-k reduce 는 `triton_unified_attention.py:926` 의 **`reduce_segments` kernel** (파일 안에 inline). 즉 vLLM 은 split-k forward + reduce 를 **한 파일에 묶어놨음**. 우리는 lesson 12 에서 `paged_attention.py` 에 두 kernel 을 나란히 둠 — 같은 설계.
+
+### `selector.py` 165 줄 읽기 결과
+
+얇은 wrapper. 실제 dispatch logic 은 두 겹 아래:
+
+```
+selector.get_attn_backend(head_size, dtype, ...)
+  → _cached_get_attn_backend(backend, config)
+    → current_platform.get_attn_backend_cls(backend, config)   ← HW-specific
+       → vllm/platforms/cuda.py   (NVIDIA 분기)
+```
+
+즉 **L4 sm_89 + fp16 + LLaMA-3-8B 에서 어떤 backend 가 선택되나** 는 `vllm/platforms/cuda.py` 를 읽어야 함. Day 3 타깃.
+
+### Triton 3 파일의 역할 분리 (Day 1 의 질문 1 답)
+
+**정리 표**:
+
+| 파일 | lines | grid | paged? | split-k? | GQA | 용도 |
+|---|---|---|---|---|---|---|
+| `triton_unified_attention.py` | 1315 | 2D: `(Q_blocks, H_kv)` <br>3D: `(Q_blocks, H_kv, 16)` | ✅ | ✅ (16 segments hardcoded, inline reduce) | ✅ `BLOCK_M = max(16, pow2(q_per_kv))` | **메인** — prefill + decode paged |
+| `triton_decode_attention.py` | 778 | stage1 `(B, H, NUM_SPLITS)` + stage2 `(B, H)` | ❌ (contiguous) | ✅ (always, no heuristic) | ✅ (별도 grouped 변형) | decode-only, contiguous |
+| `triton_prefill_attention.py` | 253 | `(B, H, M_blocks)` | ❌ | ❌ | ✅ `kv_group_num` | 초기 prefill (캐시 없을 때), SGLang adapt |
+| `triton_merge_attn_states.py` | 175 | `(num_tokens, H_q)` | n/a | n/a (2-way merge) | n/a | **prefix caching**, 완전 다른 문제 |
+
+### 우리 lesson 12 vs vLLM unified 의 실제 diff
+
+| 측면 | 우리 (lesson 12) | vLLM unified |
+|---|---|---|
+| split-k 결정 | `B*H_kv < 0.5*SM ∧ segments ≥ 4` — **SM utilization 중심** | `num_seqs > 128/num_kv_heads` — **batch-count 중심** |
+| SEGMENTS | `ceil(ctx / PARTITION_SIZE)` — **ctx 적응형** | **16 hardcoded** — 짧은 ctx 에선 낭비, 긴 ctx 에선 부족 |
+| Reduce kernel | 별도 파일 (`paged_attention.py` 안 나란히) | 같은 파일 inline (`reduce_segments`) |
+| Prefill 통합 | ❌ (decode only) | ✅ (한 kernel) |
+| Scratch allocation | 호출 시 alloc | **backend 에서 사전 alloc** (`softmax_segm_output` 등 `seq_threshold_3D × H_q × 16 × padded_d`) — warm path 빠름 |
+| Precision (fp32) | `input_precision="ieee"` 명시 | 명시 없음 (fp16/bf16 위주 가정) |
+
+### Day 2 에 새로 드러난 candidate 후보
+
+**Candidate A — adaptive NUM_SEGMENTS for vLLM unified**
+- vLLM 이 16 segments 하드코딩 → 긴 ctx 에선 segment 당 작업이 너무 커서 SM 점유율 회복이 부족. 짧은 ctx 에선 낭비.
+- 우리 lesson 12 의 `ceil(ctx / PARTITION_SIZE)` 로직 + auto-dispatch heuristic 을 unified kernel 의 dispatcher 에 포팅.
+- 난이도: **낮음-중간**. Dispatch wrapper 쪽 Python 만 건드리면 됨. Triton kernel 본체 변경 없음.
+- 임팩트: **불확실** — 16 이 "good enough" 일 수도. 벤치 필요 (Day 5).
+
+**Candidate B — SM-utilization based heuristic**
+- 현재 vLLM 은 `num_seqs > 128/num_kv_heads` — 이건 "H_kv 가 클 때만 batch 커지면 split-k 안 씀" 뜻. 우리 lesson 12 에서 봤듯, 진짜 문제는 `B*H_kv` 가 SM 대비 작을 때. 우리 heuristic 이 직접 문제 정조준.
+- 난이도: **중간**. Dispatch 로직 + 테스트 케이스 업데이트.
+- 임팩트: **높음** — MQA 같은 edge shape 에서 이미 vLLM 이 잘못 고르고 있을 수 있음 (Day 5 에서 확인).
+
+**Candidate C — prefix-caching merge 를 N-way 로 일반화**
+- 현재 `merge_attn_states` 는 2-way (prefix + suffix). N-way 면 중첩 prefix (A → AB → ABC) 를 한 번에 merge 가능. 현재는 반복 호출.
+- 난이도: **높음**. 수학은 간단하지만 API breaking change 가능성 + prefix caching 구조 이해 필요.
+- 임팩트: **중간** — prefix caching 은 hot 이지만 2-way 중첩의 실제 빈도 알려면 측정 필요.
+
+**Candidate D — fp32 IEEE path 추가**
+- vLLM unified 가 `input_precision` 명시 안 함. production 은 fp16/bf16 이라 문제 없지만, research / debug 에선 정밀도 이슈. 우리 lesson 11 에서 정확히 겪은 건.
+- 난이도: **낮음**. 분기 한 줄 + 테스트.
+- 임팩트: **낮음-중간**. Niche 지만 실제 요청하는 사용자 있음.
+
+---
+
+## Day 3 target (다음 세션)
+
+- `vllm/platforms/cuda.py` 읽어서 **dispatch rule 완전히 드러내기** (L4 + fp16 + LLaMA-3-8B 에서 어떤 backend 선택되나 명확히).
+- `TritonAttentionBackend` (`triton_attn.py`) 의 metadata 빌드 + forward 엔드투엔드 따라가기.
+- 가능하면 Day 4 로 넘어가서 실제 unified_attention dispatch 가 호출되는 request 경로 trace (scheduler → worker → backend).
+
+**산출물**: 이 문서의 §Day 3 섹션 + dispatch sequence 다이어그램 (ascii 로 충분).
+
+Week 1 Day 5 는 bench 로 candidate 검증 (A/B/C/D 중 어느 것이 실제 숫자로 가치 있는지), Day 6-7 에 최종 선정.
+
+---
 
 ---
 
