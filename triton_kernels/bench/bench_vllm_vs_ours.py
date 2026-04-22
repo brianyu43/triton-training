@@ -10,7 +10,7 @@ on smaller GPUs like L4 (58 SMs), where `B * H_kv` values in [30, 128]
 saturate the device on the single-pass path but vLLM still pays the
 split-k reduce-kernel overhead.
 
-Three implementations are compared on the same paged layout, same Q/K/V:
+Four implementations are compared on the same paged layout, same Q/K/V:
 
   (1) ours          — triton_paged_attention_decode(..., use_split_k=None)
                       Heuristic: B*H_kv < 0.5*num_SMs AND segments >= 4.
@@ -23,6 +23,14 @@ Three implementations are compared on the same paged layout, same Q/K/V:
                       threshold. Isolates "the heuristic is wrong" from
                       "our kernel is faster" — if (3) beats (2), the win is
                       purely from smarter dispatch on vLLM's code.
+  (4) vllm_adaptive — (Stage 1.5) same as (3) but additionally sets
+                      num_par_softmax_segments = ceil(ctx/512) (clamped to
+                      [1,32]) instead of the upstream-hardcoded 16.
+                      Isolates "SEGMENTS count was wrong" from the rest of
+                      the kernel gap. If (4) ≈ ours ≪ (3) on SP|3D|3D shapes,
+                      the lesson-12-style adaptive segment count is the fix.
+                      If (4) ≈ (3), SEGMENTS is not the dominant factor and
+                      the kernel gap is grid/scratch/flat-token related.
 
 Expected on L4 (58 SMs):
   - Shapes where B*H_kv ∈ [30, 128] AND ctx ≥ 2k:
@@ -74,7 +82,29 @@ from triton_kernels.vllm_extracted import unified_attention
 # seq_threshold_3D knob is the ONLY thing controlling dispatch.
 
 
-_NUM_SEGMENTS = 16  # matches vLLM/v1/attention/backends/triton_attn.py:50
+_NUM_SEGMENTS_DEFAULT = 16  # matches vLLM/v1/attention/backends/triton_attn.py:50
+
+_ADAPTIVE_PARTITION_SIZE = 512      # lesson-12 convention
+_ADAPTIVE_MIN_SEGMENTS = 1
+_ADAPTIVE_MAX_SEGMENTS = 32          # bound Triton recompiles + scratch
+
+
+def adaptive_num_segments(ctx: int, partition_size: int = _ADAPTIVE_PARTITION_SIZE) -> int:
+    """Lesson-12 style segment count: ceil(ctx / partition_size), clamped.
+
+    At partition_size=512 this yields:
+      ctx=256  → 1  (degenerate — 3D with 1 segment ≈ 2D, plus reduce overhead)
+      ctx=1024 → 2
+      ctx=2048 → 4
+      ctx=4096 → 8
+      ctx=8192 → 16 (= upstream default)
+
+    So the adaptive variant is STRICTLY ≤ upstream on ctx ≤ 8k. The hypothesis
+    is that upstream's 16 over-splits short-ctx shapes, leaving per-segment
+    work too small to amortize the reduce kernel launch.
+    """
+    n = (ctx + partition_size - 1) // partition_size
+    return max(_ADAPTIVE_MIN_SEGMENTS, min(_ADAPTIVE_MAX_SEGMENTS, n))
 
 
 def _pow2_up(n: int) -> int:
@@ -89,8 +119,17 @@ def vllm_decode_wrapper(
     context_lens: torch.Tensor,      # (B,) int32
     scale: float,
     seq_threshold_3D: int,
+    num_segments: int = _NUM_SEGMENTS_DEFAULT,
 ) -> torch.Tensor:
-    """Adapter: (B, H_q, d) decode → vLLM's flat-token unified_attention."""
+    """Adapter: (B, H_q, d) decode → vLLM's flat-token unified_attention.
+
+    Both ``num_par_softmax_segments`` and the scratch-tensor shape are driven
+    by ``num_segments``. They MUST match — the 3D kernel strides its writes by
+    ``NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED`` (unified_attention.py:936-937),
+    and the reduce kernel reads the same stride (line 1017-1019). Using scratch
+    sized for 16 with num_par_softmax_segments=2 would leave the reduce reading
+    garbage past the first 2 segments of each token.
+    """
     B, H_q, d = Q.shape
     num_blocks, block_size, H_kv, _ = K_cache.shape
     head_size_padded = _pow2_up(d)
@@ -101,12 +140,12 @@ def vllm_decode_wrapper(
     cu_seqlens_q = torch.arange(B + 1, dtype=torch.int32, device=device)
     seqused_k = context_lens.to(torch.int32)
 
-    # 3D scratch — always allocated, shaped for worst case.
+    # 3D scratch sized to exactly num_segments (see docstring).
     segm_output = torch.empty(
-        (B, H_q, _NUM_SEGMENTS, head_size_padded), dtype=torch.float32, device=device
+        (B, H_q, num_segments, head_size_padded), dtype=torch.float32, device=device
     )
-    segm_max = torch.empty((B, H_q, _NUM_SEGMENTS), dtype=torch.float32, device=device)
-    segm_expsum = torch.empty((B, H_q, _NUM_SEGMENTS), dtype=torch.float32, device=device)
+    segm_max = torch.empty((B, H_q, num_segments), dtype=torch.float32, device=device)
+    segm_expsum = torch.empty((B, H_q, num_segments), dtype=torch.float32, device=device)
 
     unified_attention(
         q=Q,
@@ -126,7 +165,7 @@ def vllm_decode_wrapper(
         k_descale=1.0,
         v_descale=1.0,
         seq_threshold_3D=seq_threshold_3D,
-        num_par_softmax_segments=_NUM_SEGMENTS,
+        num_par_softmax_segments=num_segments,
         softmax_segm_output=segm_output,
         softmax_segm_max=segm_max,
         softmax_segm_expsum=segm_expsum,
@@ -216,19 +255,29 @@ def smoke_correctness(cfg: SmokeConfig) -> None:
     out_vllm_2d = vllm_decode_wrapper(
         Q, K_cache, V_cache, block_table, context_lens, scale, seq_threshold_3D=0
     )
-    # Force vLLM 3D: threshold=huge → B (=2) <= huge, picks 3D.
+    # Force vLLM 3D with default 16 segments.
     out_vllm_3d = vllm_decode_wrapper(
         Q, K_cache, V_cache, block_table, context_lens, scale, seq_threshold_3D=10**6
+    )
+    # Force vLLM 3D with adaptive segments. At ctx=768 this is 2 segments —
+    # very different scratch stride from the 16-segment version, so this
+    # catches any stride-mismatch regression in the wrapper.
+    adp_segs = adaptive_num_segments(N)
+    out_vllm_3d_adp = vllm_decode_wrapper(
+        Q, K_cache, V_cache, block_table, context_lens, scale,
+        seq_threshold_3D=10**6, num_segments=adp_segs,
     )
 
     atol, rtol = 5e-3, 5e-3  # fp16 tolerance
     checks = [
-        ("ours-SP   vs ref", out_ours_sp, out_ref),
-        ("ours-SK   vs ref", out_ours_sk, out_ref),
-        ("vllm-2D   vs ref", out_vllm_2d, out_ref),
-        ("vllm-3D   vs ref", out_vllm_3d, out_ref),
-        ("vllm-2D   vs ours-SP", out_vllm_2d, out_ours_sp),
-        ("vllm-3D   vs ours-SK", out_vllm_3d, out_ours_sk),
+        ("ours-SP        vs ref", out_ours_sp, out_ref),
+        ("ours-SK        vs ref", out_ours_sk, out_ref),
+        ("vllm-2D        vs ref", out_vllm_2d, out_ref),
+        ("vllm-3D (16)   vs ref", out_vllm_3d, out_ref),
+        (f"vllm-3D ({adp_segs:>2d})   vs ref", out_vllm_3d_adp, out_ref),
+        ("vllm-2D        vs ours-SP", out_vllm_2d, out_ours_sp),
+        ("vllm-3D (16)   vs ours-SK", out_vllm_3d, out_ours_sk),
+        (f"vllm-3D ({adp_segs:>2d})   vs vllm-3D (16)", out_vllm_3d_adp, out_vllm_3d),
     ]
     all_ok = True
     print(f"\n[smoke] B={B} H_q={H_q} H_kv={H_kv} d={d} ctx={N} dtype={cfg.dtype}")
@@ -301,6 +350,7 @@ def bench_one(case: BenchCase, verbose: bool = True) -> dict:
     num_sms = _DEFAULT_SM_COUNT
     vllm_default_thresh = 128 // H_kv
     vllm_smaware_thresh = (num_sms // 2) // max(H_kv, 1)
+    adp_segs = adaptive_num_segments(N)
 
     def run_ours():
         return triton_paged_attention_decode(
@@ -319,21 +369,31 @@ def bench_one(case: BenchCase, verbose: bool = True) -> dict:
             seq_threshold_3D=vllm_smaware_thresh,
         )
 
+    def run_vllm_adaptive():
+        return vllm_decode_wrapper(
+            Q, K_cache, V_cache, block_table, context_lens, scale,
+            seq_threshold_3D=vllm_smaware_thresh,
+            num_segments=adp_segs,
+        )
+
     t_ours = _time_ms(run_ours)
     t_vllm_def = _time_ms(run_vllm_default)
     t_vllm_sma = _time_ms(run_vllm_smaware)
+    t_vllm_adp = _time_ms(run_vllm_adaptive)
 
     path_ours = _predict_ours_path(B, H_kv, N, partition_size=512)
     path_vllm_def = _predict_vllm_path(B, vllm_default_thresh)
     path_vllm_sma = _predict_vllm_path(B, vllm_smaware_thresh)
+    path_vllm_adp = _predict_vllm_path(B, vllm_smaware_thresh)  # same dispatch rule as smaware
 
     if verbose:
         print(
             f"  {case.name:30s}  "
             f"B*H_kv={B*H_kv:4d}  ctx={N:5d}  "
             f"ours[{path_ours}] {t_ours:6.3f}ms   "
-            f"vllm-def[{path_vllm_def}] {t_vllm_def:6.3f}ms  ({t_vllm_def/t_ours:4.2f}x ours)   "
-            f"vllm-sma[{path_vllm_sma}] {t_vllm_sma:6.3f}ms  ({t_vllm_sma/t_ours:4.2f}x ours)"
+            f"vllm-def[{path_vllm_def}] {t_vllm_def:6.3f}ms ({t_vllm_def/t_ours:4.2f}x)   "
+            f"vllm-sma[{path_vllm_sma}] {t_vllm_sma:6.3f}ms ({t_vllm_sma/t_ours:4.2f}x)   "
+            f"vllm-adp[{path_vllm_adp}/{adp_segs:>2d}seg] {t_vllm_adp:6.3f}ms ({t_vllm_adp/t_ours:4.2f}x)"
         )
 
     return dict(
@@ -341,12 +401,15 @@ def bench_one(case: BenchCase, verbose: bool = True) -> dict:
         B=B, H_q=H_q, H_kv=H_kv, ctx=N, num_sms=num_sms,
         vllm_default_thresh=vllm_default_thresh,
         vllm_smaware_thresh=vllm_smaware_thresh,
+        vllm_adaptive_segments=adp_segs,
         path_ours=path_ours,
         path_vllm_default=path_vllm_def,
         path_vllm_smaware=path_vllm_sma,
+        path_vllm_adaptive=path_vllm_adp,
         t_ours_ms=t_ours,
         t_vllm_default_ms=t_vllm_def,
         t_vllm_smaware_ms=t_vllm_sma,
+        t_vllm_adaptive_ms=t_vllm_adp,
     )
 
 
@@ -406,6 +469,10 @@ def main():
                     help="directory to write CSV + JSON results (default: bench_results/)")
     ap.add_argument("--quiet-sweep", action="store_true",
                     help="suppress per-row logging for sweep (CSV only)")
+    ap.add_argument("--tag-prefix", type=str, default="l13_candidateB_stage1",
+                    help="filename prefix for output CSV/JSON "
+                         "(default: l13_candidateB_stage1 — use "
+                         "'l13_candidateB_stage1_5' for Stage 1.5 runs)")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -426,12 +493,13 @@ def main():
     if not args.skip_smoke:
         smoke_correctness(SmokeConfig())
 
-    print("\n[bench] 3-way dispatch comparison  (time is median of %d iters, 10 warmup)"
+    print("\n[bench] 4-way dispatch comparison  (time is median of %d iters, 10 warmup)"
           % args.iters)
     print("  legend: path = [SP|SK] for ours, [2D|3D] for vllm; "
           "3D/SK means split-k was chosen")
     print("  threshold: vllm-def = 128 // H_kv (upstream); "
-          "vllm-sma = (num_SMs//2) // H_kv  (SM-aware)")
+          "vllm-sma = (num_SMs//2) // H_kv  (SM-aware); "
+          "vllm-adp = vllm-sma + NUM_SEGMENTS=ceil(ctx/512) clamped to [1,32]")
 
     rows: list[dict] = []
 
@@ -452,33 +520,47 @@ def main():
                          **bench_one(case, verbose=not args.quiet_sweep)})
 
     # --- Summary ---
-    print("\n[summary] cases where vLLM's 128 threshold misfires vs SM-aware:")
-    any_flag = False
-    flagged = []
+    # For each row, compute:
+    #   gap_default  = t_vllm_default  / t_ours - 1  (bigger = worse for vllm)
+    #   gap_smaware  = t_vllm_smaware  / t_ours - 1
+    #   gap_adaptive = t_vllm_adaptive / t_ours - 1
+    # Three useful buckets:
+    #   (A) dispatch-only wins   — smaware closes ≤10% gap   (Stage 1 finding: ~8 shapes)
+    #   (B) adaptive-only wins   — adaptive closes ≤10% gap but smaware does NOT
+    #                              → "SEGMENTS was the kernel-gap culprit"
+    #   (C) still-stuck          — even adaptive stays >10% off ours
+    #                              → remaining kernel difference is grid/scratch/flat-token, not SEGMENTS
+    print("\n[summary] variant effectiveness relative to ours (where vllm-default is >5% slower):")
+
+    def gap(t_v, t_o): return (t_v / t_o - 1.0) * 100.0
+    A, B_, C = [], [], []
     for r in rows:
-        slower_pct = (r["t_vllm_default_ms"] / r["t_ours_ms"] - 1.0) * 100
-        vllm_sm_gap = abs(r["t_vllm_smaware_ms"] / r["t_ours_ms"] - 1.0) * 100
-        if slower_pct > 5 and vllm_sm_gap < 10:
-            any_flag = True
-            flagged.append((slower_pct, r))
-    flagged.sort(key=lambda x: -x[0])
-    for slower_pct, r in flagged[:20]:
-        vllm_sm_gap = abs(r["t_vllm_smaware_ms"] / r["t_ours_ms"] - 1.0) * 100
-        print(
-            f"  - {r['case']}: vllm-default +{slower_pct:.1f}% vs ours   "
-            f"(vllm-sma within {vllm_sm_gap:.1f}%)   "
-            f"paths: ours={r['path_ours']} vllm-def={r['path_vllm_default']} "
-            f"vllm-sma={r['path_vllm_smaware']}"
-        )
-    if not any_flag:
-        print("  (none — heuristic difference did not materialize on these shapes)")
-    elif len(flagged) > 20:
-        print(f"  ... +{len(flagged) - 20} more flagged cases in CSV")
+        g_def = gap(r["t_vllm_default_ms"],  r["t_ours_ms"])
+        g_sma = gap(r["t_vllm_smaware_ms"],  r["t_ours_ms"])
+        g_adp = gap(r["t_vllm_adaptive_ms"], r["t_ours_ms"])
+        if g_def <= 5:
+            continue
+        if g_sma <= 10:
+            A.append((g_def, g_sma, g_adp, r))
+        elif g_adp <= 10:
+            B_.append((g_def, g_sma, g_adp, r))
+        else:
+            C.append((g_def, g_sma, g_adp, r))
+
+    print(f"  (A) dispatch-only closes to ≤10% of ours:  {len(A):>3d} shapes")
+    for g_def, g_sma, g_adp, r in sorted(A, key=lambda x: -x[0])[:10]:
+        print(f"        {r['case']:40s}  def +{g_def:5.1f}% → sma +{g_sma:5.1f}% (adp +{g_adp:5.1f}%)  paths {r['path_ours']}|{r['path_vllm_default']}|{r['path_vllm_smaware']}")
+    print(f"  (B) adaptive-SEGMENTS recovers ≤10% where sma could not:  {len(B_):>3d} shapes")
+    for g_def, g_sma, g_adp, r in sorted(B_, key=lambda x: -(x[1] - x[2]))[:10]:
+        print(f"        {r['case']:40s}  def +{g_def:5.1f}% → sma +{g_sma:5.1f}% → adp +{g_adp:5.1f}%  ({r['vllm_adaptive_segments']:>2d} seg)")
+    print(f"  (C) kernel gap remains >10% even with adaptive:  {len(C):>3d} shapes")
+    for g_def, g_sma, g_adp, r in sorted(C, key=lambda x: -x[2])[:10]:
+        print(f"        {r['case']:40s}  def +{g_def:5.1f}%   sma +{g_sma:5.1f}%   adp +{g_adp:5.1f}%  ({r['vllm_adaptive_segments']:>2d} seg)")
 
     # --- Persist ---
     os.makedirs(args.out_dir, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    tag = f"l13_candidateB_stage1_{ts}"
+    tag = f"{args.tag_prefix}_{ts}"
     if args.sweep:
         tag += "_sweep"
     meta = {
