@@ -127,6 +127,10 @@ def run_variant(cfg: RunConfig) -> dict:
         enforce_eager=False,
         max_model_len=cfg.max_model_len,
         gpu_memory_utilization=cfg.gpu_memory_utilization,
+        # Force the Triton unified-attention backend. Without this vLLM
+        # auto-selects FA2, which bypasses the triton_attn.py heuristic
+        # we're studying — the bench would measure nothing about our patch.
+        attention_backend="TRITON_ATTN",
     )
 
     print(f"[warmup] {cfg.warmup} iterations of batch={cfg.batch_size}")
