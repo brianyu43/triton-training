@@ -1,9 +1,11 @@
-# vLLM Audit 02 — Candidate B Stage 1: Kernel-Level Bench (L4, sm_89)
+# vLLM Audit 02 — Candidate B: Kernel-Level + e2e Bench (L4, sm_89)
 
-Lesson 13, Week 2 Day 1-2. Candidate B (`seq_threshold_3D = 128 // num_kv_heads` dispatch heuristic) 의 Stage 1 검증 결과.
+Lesson 13, Week 2 Day 1-3. Candidate B (`seq_threshold_3D = 128 // num_kv_heads` dispatch heuristic) 의 Stage 1 (kernel-level) + Stage 1.5 (adaptive SEGMENTS 실험) + Stage 2 (vLLM e2e) 검증 결과.
 
-- 실행: 2026-04-22, GCP L4 VM `cuda-l4-dev-lesson09` (nemo-488500 / us-east4-c, NVIDIA L4, 58 SMs, sm_89, torch 2.11.0+cu130, triton 3.6.0)
-- 산출물: [`bench_vllm_vs_ours.py`](/Users/xavier/dev/cudatraining/triton_kernels/bench/bench_vllm_vs_ours.py:1), [`vllm_extracted/unified_attention.py`](/Users/xavier/dev/cudatraining/triton_kernels/vllm_extracted/unified_attention.py:1), raw CSV/JSON at `bench_results/l13_candidateB_stage1_20260422T140*.{csv,json}`
+- 실행:
+  - Stage 1 / 1.5 : 2026-04-22, GCP L4 VM `cuda-l4-dev-lesson09` (nemo-488500 / us-east4-c, NVIDIA L4, 58 SMs, sm_89, torch 2.11.0+cu130, triton 3.6.0)
+  - Stage 2     : 2026-04-23, 동일 VM, vLLM 0.19.1 (pip install), TinyLlama-1.1B-Chat-v1.0, float16, `attention_backend=TRITON_ATTN`
+- 산출물: [`bench_vllm_vs_ours.py`](/Users/xavier/dev/cudatraining/triton_kernels/bench/bench_vllm_vs_ours.py:1), [`bench_vllm_e2e.py`](/Users/xavier/dev/cudatraining/triton_kernels/bench/bench_vllm_e2e.py:1), [`vllm_extracted/unified_attention.py`](/Users/xavier/dev/cudatraining/triton_kernels/vllm_extracted/unified_attention.py:1), [`scripts/toggle_vllm_patch.py`](/Users/xavier/dev/cudatraining/scripts/toggle_vllm_patch.py:1), raw CSV/JSON at `bench_results/l13_candidateB_stage1_20260422T140*.{csv,json}` 및 `bench_results/l13_candidateB_stage2_20260423T073336Z_*.{csv,json}`
 
 ---
 
@@ -14,6 +16,7 @@ Lesson 13, Week 2 Day 1-2. Candidate B (`seq_threshold_3D = 128 // num_kv_heads`
 3. **Dispatch 수정만으로 10% 이내로 닫히는 shape 은 73 개 regression 중 8 개 (11%).** 65 개 (89%) 는 dispatch 를 고쳐도 여전히 10%+ 뒤처진다.
 4. **Stage 1.5 (adaptive NUM_SEGMENTS)** — kernel gap 의 범인이 "SEGMENTS=16 하드코드" 인지 검증. **부정 결과**. Adaptive `ceil(ctx/512)` 로 바꾸면 geomean 이 오히려 1.4 pp 악화, adaptive-only 로 새로 닫는 shape 은 0 개, 작은 batch 규모 shape 에선 최대 +19.6 pp 퇴보. **16 은 small-batch occupancy multiplier 로 동작하는 rational default** 임이 확인됨.
 5. 따라서 PR scope 가 **scenario A (dispatch-only)** 로 확정됨. Kernel gap 의 주원인은 SEGMENTS 가 아니라 grid/BLOCK_M 설계일 가능성이 높음 (§6.6 가설) — 별도 track.
+6. **Stage 2 (vLLM e2e)** — dispatch 수정이 e2e decode throughput 으로 **실제로 이어지는가** 검증. TinyLlama-1.1B (H_kv=4) + batch∈{8,16,32} (vanilla threshold=32 / smaware threshold=7 사이 divergence zone) decode-heavy 워크로드에서 **smaware 가 batch=16 에서 +2.89% tok/s, batch=32 에서 +5.13% tok/s 개선. batch=8 은 노이즈 범위 (-0.14%)**. Stage 1 에서 본 kernel-level 20~25% gap 의 약 ~20% 가 e2e 로 translate — 1.1B 모델에서 attention 이 decode wall time 의 제한적 부분이라는 점을 고려하면 상식적인 ratio.
 
 ---
 
@@ -322,10 +325,9 @@ Stage 1 이후 고민했던 3 개 시나리오 (A/B/C) 중:
 
 ## 7. Next
 
-- **확정**: 시나리오 A 로 upstream issue 드래프트. scope 는 `triton_attn.py:163` 의 `128` 을 `max(128, num_sms) // max(H_kv, 1)` 같은 SM-aware 로 대체. 증거 첨부: 본 문서 §2 table + §3.2 table + §6.1 table.
-- **판단 필요**: Stage 2 (vLLM 서버 e2e bench) 를 바로 진행하는가, 아니면 issue 먼저 열어 maintainer 반응 본 후 결정하는가?
-  - **권장: issue 먼저.** e2e 세팅은 시간이 많이 들고 (vLLM 서버 + 클라이언트 + 모델 다운로드 + 워크로드), maintainer 가 "L4 는 우리 타겟 아님" 이라고 답하면 Stage 2 를 버려야 함. Issue → 반응 양호 → Stage 2 순.
-- **Optional**: Stage 1.75 (grid/BLOCK_M 차이가 kernel gap 의 주원인인지 한 실험으로 확인). Stage 2 e2e 에 의존적이지 않으므로 병렬로 진행 가능. 가치: 추후 kernel PR 의 근거.
+- **확정**: 시나리오 A 로 upstream issue 드래프트. scope 는 `triton_attn.py:163` 의 `128` 을 `max(128, num_sms) // max(H_kv, 1)` 같은 SM-aware 로 대체. 증거 첨부: 본 문서 §2 table + §3.2 table + §6.1 table + §8 e2e table.
+- **Stage 2 (e2e) 완료** — §8 참고. Dispatch-only 가 실제 decode throughput 으로 측정 가능한 개선 (batch=32 에서 +5.13% tok/s) 을 보여줘서 PR 프레이밍을 "correctness-of-heuristic + measurable e2e win on underfilled-SM GPUs" 로 강화 가능.
+- **Optional**: Stage 1.75 (grid/BLOCK_M 차이가 kernel gap 의 주원인인지 한 실험으로 확인). 가치: 추후 kernel PR 의 근거.
 
 ### Open questions (updated)
 
@@ -333,6 +335,101 @@ Stage 1 이후 고민했던 3 개 시나리오 (A/B/C) 중:
 2. L4 의 발견이 A100/H100 에서도 같은 방향/같은 크기인가? — 미해결. Dispatch-only PR 설명에 "L4 에서 관측; A100 은 `128/(108/2) ≈ 2.4x` 이므로 threshold 도 같은 방향으로 underfit 가능성. H100 은 `128/(132/2) ≈ 1.9x`, 경계. 재현 가능한 bench script 첨부." 로 프레이밍.
 3. SM-aware threshold 의 구체적 공식 — `(num_SMs // 2) // H_kv` 는 우리가 임의로 정한 값. `num_SMs // H_kv` 나 `num_SMs * 3 // 4 // H_kv` 같은 다른 식도 실험해볼 가치. PR 전에 sensitivity 측정 짧게 추가 권장.
 4. Grid/BLOCK_M 이 kernel gap 의 주원인인지 (Stage 1.75 질문).
+5. Larger model (Qwen2.5-7B, Llama-3.2-3B) 및 longer context 에서 e2e gain 이 비례/성장하는가? — 미해결. 1.1B 는 MLP-bound 라 attention share 가 작음. 7B 에서는 attention share 가 커져 e2e gain 이 더 클 것으로 예상.
+
+---
+
+## 8. Stage 2 — vLLM e2e validation
+
+Stage 1 이 "attention kernel call 한 번 의 latency gap" 을 측정했다면, Stage 2 는 **"그 gap 이 decode throughput 으로 실제 이어지는가"** 를 확인한다. Attention 은 decode 시간의 일부분이므로 (MatMul, softmax, norm, tokenizer, scheduler 등과 공유), per-call 25% 개선이 e2e 몇 % 로 translate 되는지 측정해야 PR 의 실질적 가치를 판단할 수 있다.
+
+### 8.1 Setup
+
+| 항목 | 값 |
+|---|---|
+| VM | `cuda-l4-dev-lesson09`, L4 (58 SMs, sm_89) |
+| vLLM | 0.19.1 (pip install, venv `/home/xavier/vllm-venv`) |
+| Backend | `attention_backend="TRITON_ATTN"` (강제 지정 — 기본값은 FA2 로 떨어져서 heuristic 을 안 거침) |
+| Model | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` (H_q=32, H_kv=4, d=64, 22 layers, non-gated) |
+| Dtype | float16 |
+| Workload | 32-token prompt, `max_tokens=256`, `temperature=0.0`, `ignore_eos=True`, `enforce_eager=False` (CUDA Graphs on), `gpu_memory_utilization=0.80`, `max_model_len=2048` |
+| Batches | {8, 16, 32} — divergence zone on L4/H_kv=4 (vanilla threshold = `128//4 = 32`, smaware threshold = `29//4 = 7`; vanilla 는 세 batch 모두 3D, smaware 는 세 batch 모두 2D 로 분기됨) |
+| Measure | `llm.generate(prompts, ...)` wall time, 5 iters measure + 2 warmup per batch, `torch.cuda.synchronize()` pre/post |
+
+모델 선택 근거:
+- HF gated (Llama-3.2) 을 피하고 L4 VM 의 토큰 설정 부담 없이 바로 재현 가능할 것.
+- H_kv=4 로 batch∈{8,16,32} 가 vanilla 와 smaware 의 dispatch 가 엇갈리는 구간을 정확히 커버.
+- 1.1B 이라 모델 자체가 메모리-바운드라 attention share 가 큰 편은 아니다는 점 인지 — 따라서 이 결과는 e2e gain 의 **보수적 하한선** 으로 해석.
+
+### 8.2 Patch toggle
+
+`scripts/toggle_vllm_patch.py` — 설치된 vLLM tree 의 `triton_attn.py` 의 `self.seq_threshold_3D = ...` line 을 vanilla/smaware 로 flip. Anchor pattern-match (line-number 가 아닌) 로 version drift 에 강함 (0.19.1 에서는 line 151, upstream main 에서는 line 163 — 같은 script 가 둘 다 잡음). `.pyc` 도 같이 정리.
+
+```bash
+python scripts/toggle_vllm_patch.py --mode vanilla --yes  # 원상 복구
+python scripts/toggle_vllm_patch.py --mode smaware --yes  # patch 적용
+python scripts/toggle_vllm_patch.py --status              # 현재 상태만 리포트
+```
+
+### 8.3 Results
+
+| batch | dispatch (vanilla / smaware) | vanilla wall_ms (median ± stdev) | smaware wall_ms | vanilla tok/s | smaware tok/s | **Δtok/s %** |
+|---:|:---:|---:|---:|---:|---:|---:|
+| 8  | 3D / 2D | 2350.7 ± 1.4 | 2354.0 ± 1.2 |  871.2 |  870.0 | **−0.14%** |
+| 16 | 3D / 2D | 2426.4 ± 0.5 | 2358.3 ± 1.0 | 1688.1 | 1736.9 | **+2.89%** |
+| 32 | 3D / 2D | 2718.1 ± 1.6 | 2585.4 ± 1.9 | 3013.8 | 3168.5 | **+5.13%** |
+
+(median-of-5 iters, 각 iter 당 `batch × 256` decode step. `ignore_eos=True` 로 모든 seq 가 max_tokens 까지 decode. stdev 은 sub-%; 측정 안정적.)
+
+### 8.4 해석
+
+1. **Dispatch 변화가 e2e 로 실제로 이어진다.** Batch=16, 32 에서 개선폭이 노이즈 대비 2~3 sigma 이상 (stdev ~0.05% vs Δ 2.89~5.13%). 단순 "kernel micro-bench 상 차이" 가 아니라 throughput 에 반영되는 real effect.
+
+2. **Batch 크기에 비례해 gain 이 커진다.** 이는 dispatch 변경이 두 경로의 parallelism 차이를 반영하는 패턴과 일치. vanilla 의 3D split-k 는 segments 축을 추가해 더 잘게 쪼개지만, L4 (58 SM) 에서 outer grid 가 이미 작을 때 (num_q_blocks=1~2, H_kv=4) 3D 가 제공하는 extra parallelism 은 실제 SM 을 더 채우기보다 **launch/reduction overhead 만 추가** — batch=32 는 2D single-pass 의 장점이 가장 크게 드러나는 지점. Batch=8 은 outer grid 가 너무 작아 2D/3D 모두 underfill 이라 둘 다 나쁨.
+
+3. **Per-call gap (Stage 1 ~23.8% median) 이 e2e 5.13% 로 translate** — attention 이 TinyLlama-1.1B decode 시간의 ~20% 정도를 차지한다는 얘기. 실제로 소형 모델은 MLP 가 지배적이므로 합리적인 ratio. 더 큰 모델 (H_kv=8/d=128 7B+) 에서는 attention share 가 커져서 e2e gain 이 더 클 것으로 예상 (Open question #5).
+
+4. **Stage 1.5 가 보여준 adaptive-SEGMENTS 의 negative result 와 consistent.** e2e 에서도 "segments 축 추가 parallelism" 의 비용 (reduction, extra mem bandwidth) 이 작은 outer grid 에서 **benefit 보다 크다** 는 본질이 같음. Dispatch 를 2D 로 forcing 하면 이 overhead 자체가 사라짐.
+
+### 8.5 PR 프레이밍 (업데이트)
+
+기존 Stage 1 만 있었을 때는 "correctness-of-heuristic" (constant 128 이 small-SM GPU 에서 underfit) 이 주 프레임이었고 performance 는 "modest" 정도로 표현 예정. Stage 2 추가로:
+
+- **Primary claim** — "`128` constant 가 L4 (58 SM) 에서 under-fills SMs 를 dispatch-level 에서 잘못 판단한다" (correctness).
+- **Secondary claim** — "실제 decode throughput 에서 batch=16 +2.9%, batch=32 +5.1% 향상, kernel-micro 수준 23.8% 의 약 20% 가 e2e 로 translate" (performance, measurable).
+- **Caveat** — "L4 에서 관측; A100/H100 에서도 같은 방향의 underfit 가능성 있으나 미검증. 재현 가능한 bench script (Stage 1 `bench_vllm_vs_ours.py` + Stage 2 `bench_vllm_e2e.py` + `scripts/toggle_vllm_patch.py`) 첨부."
+
+이 프레이밍이면 maintainer 가 "L4 타겟 아님" 이라고 쳐내기 힘듦 (correctness 논점이 performance 에서 온 게 아니라, formula 자체의 SM-count 무지에서 옴).
+
+### 8.6 재현
+
+```bash
+# L4 VM 기준, vllm venv 활성화 상태
+source ~/vllm-venv/bin/activate
+cd ~/cudatraining-git
+
+# vanilla 기준선
+python scripts/toggle_vllm_patch.py --mode vanilla --yes
+python -m triton_kernels.bench.bench_vllm_e2e \
+    --variant vanilla \
+    --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    --batches 8 16 32 \
+    --max-new-tokens 256 --iters 5 --warmup 2 \
+    --max-model-len 2048 \
+    --tag l13_candidateB_stage2_$(date -u +%Y%m%dT%H%M%SZ)
+
+# smaware 변형
+python scripts/toggle_vllm_patch.py --mode smaware --yes
+python -m triton_kernels.bench.bench_vllm_e2e \
+    --variant smaware \
+    --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    --batches 8 16 32 \
+    --max-new-tokens 256 --iters 5 --warmup 2 \
+    --max-model-len 2048 \
+    --tag l13_candidateB_stage2_<same_tag>
+```
+
+Raw 산출물: `bench_results/l13_candidateB_stage2_20260423T073336Z_{vanilla,smaware}.{csv,json}`.
 
 ---
 
@@ -340,8 +437,11 @@ Stage 1 이후 고민했던 3 개 시나리오 (A/B/C) 중:
 
 - Audit Day 1-2: [`docs/vllm_audit_01_attention_path.md`](/Users/xavier/dev/cudatraining/docs/vllm_audit_01_attention_path.md:1)
 - Stage 1 kernel 추출: [`triton_kernels/vllm_extracted/unified_attention.py`](/Users/xavier/dev/cudatraining/triton_kernels/vllm_extracted/unified_attention.py:1), [`NOTICE.md`](/Users/xavier/dev/cudatraining/triton_kernels/vllm_extracted/NOTICE.md:1)
-- Bench harness: [`triton_kernels/bench/bench_vllm_vs_ours.py`](/Users/xavier/dev/cudatraining/triton_kernels/bench/bench_vllm_vs_ours.py:1)
+- Bench harness (Stage 1/1.5, kernel-level): [`triton_kernels/bench/bench_vllm_vs_ours.py`](/Users/xavier/dev/cudatraining/triton_kernels/bench/bench_vllm_vs_ours.py:1)
+- Bench harness (Stage 2, e2e decode): [`triton_kernels/bench/bench_vllm_e2e.py`](/Users/xavier/dev/cudatraining/triton_kernels/bench/bench_vllm_e2e.py:1)
+- Patch toggle helper: [`scripts/toggle_vllm_patch.py`](/Users/xavier/dev/cudatraining/scripts/toggle_vllm_patch.py:1)
 - Raw data (Stage 1, 3-way): `bench_results/l13_candidateB_stage1_20260422T140813Z.{csv,json}` (primary 7), `bench_results/l13_candidateB_stage1_20260422T140953Z_sweep.{csv,json}` (primary 7 + sweep 72)
 - Raw data (Stage 1.5, 4-way with adaptive SEGMENTS): `bench_results/l13_candidateB_stage1_5_20260422T150508Z.{csv,json}` (primary 7), `bench_results/l13_candidateB_stage1_5_20260422T150631Z_sweep.{csv,json}` (primary 7 + sweep 72)
+- Raw data (Stage 2, e2e vanilla vs smaware): `bench_results/l13_candidateB_stage2_20260423T073336Z_{vanilla,smaware}.{csv,json}`
 - Lesson 11 (paged attention vLLM v0 audit): [`docs/blog_draft_lesson_11_paged_attention.md`](/Users/xavier/dev/cudatraining/docs/blog_draft_lesson_11_paged_attention.md:1)
 - Lesson 12 (split-k + auto-dispatch origin): [`docs/blog_draft_lesson_12_split_k.md`](/Users/xavier/dev/cudatraining/docs/blog_draft_lesson_12_split_k.md:1)
