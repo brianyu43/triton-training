@@ -82,6 +82,8 @@ class RunConfig:
     dtype: str
     variant: str            # "vanilla" | "smaware"
     tag: str
+    max_model_len: int
+    gpu_memory_utilization: float
 
 
 def build_prompts(batch_size: int) -> list[str]:
@@ -118,12 +120,13 @@ def run_variant(cfg: RunConfig) -> dict:
         model=cfg.model,
         dtype=cfg.dtype,
         trust_remote_code=True,
-        # L4 fits 3B easily at these ctx; leave defaults for kv-cache and
-        # let vLLM pick. enforce_eager=False lets CUDA graphs do their thing
-        # (matches real deployment).
+        # L4 fits 3B/7B at tight ctx; enforce_eager=False lets CUDA graphs
+        # do their thing (matches real deployment). max_model_len is
+        # caller-controlled because native context varies by model
+        # (TinyLlama = 2048, Qwen/Llama-3 = 4096+).
         enforce_eager=False,
-        max_model_len=4096,
-        gpu_memory_utilization=0.80,
+        max_model_len=cfg.max_model_len,
+        gpu_memory_utilization=cfg.gpu_memory_utilization,
     )
 
     print(f"[warmup] {cfg.warmup} iterations of batch={cfg.batch_size}")
@@ -155,6 +158,7 @@ def run_variant(cfg: RunConfig) -> dict:
         "model": cfg.model,
         "batch_size": cfg.batch_size,
         "max_new_tokens": cfg.max_new_tokens,
+        "max_model_len": cfg.max_model_len,
         "iters": cfg.iters,
         "warmup": cfg.warmup,
         "dtype": cfg.dtype,
@@ -182,6 +186,10 @@ def main():
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--dtype", default="float16")
+    ap.add_argument("--max-model-len", type=int, default=2048,
+                    help="must be <= model's native context length")
+    ap.add_argument("--gpu-memory-utilization", type=float, default=0.80,
+                    help="vllm KV-cache memory budget as fraction of total VRAM")
     ap.add_argument("--tag", type=str, required=True,
                     help="filename stem for output CSV/JSON in bench_results/")
     ap.add_argument("--out-dir", type=str, default="bench_results")
@@ -198,6 +206,8 @@ def main():
             dtype=args.dtype,
             variant=args.variant,
             tag=args.tag,
+            max_model_len=args.max_model_len,
+            gpu_memory_utilization=args.gpu_memory_utilization,
         )
         results.append(run_variant(cfg))
 
