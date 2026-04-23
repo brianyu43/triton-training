@@ -12,7 +12,8 @@ Lesson 13, Week 2 Day 1-2. Candidate B (`seq_threshold_3D = 128 // num_kv_heads`
 1. **vLLM Triton unified attention 은 L4 에서 우리 lesson 12 kernel 대비 shape 의 대다수에서 느리다.** 79 config 중 73 개 (92%) 에서 우리가 5% 이상 빠르고, 61 개 (77%) 에서 20% 이상 빠르다. Geomean total gap **+40.9%**, median **+23.8%**.
 2. **원인 분해 결과, 문제는 "dispatch heuristic 하나" 가 아니다.** Dispatch 를 SM-aware 로 고치면 geomean **+4.1%** / median **+2.4%** 밖에 회복 안 된다. 나머지 (geomean +35.4% / median +23.2%) 는 **kernel 자체** 의 gap 이다.
 3. **Dispatch 수정만으로 10% 이내로 닫히는 shape 은 73 개 regression 중 8 개 (11%).** 65 개 (89%) 는 dispatch 를 고쳐도 여전히 10%+ 뒤처진다.
-4. 따라서 **Candidate B 는 "깔끔한 heuristic PR" 이 아니라 "heuristic + kernel" 두 축으로 봐야** 한다. PR story 를 다음 섹션에서 재구성.
+4. **Stage 1.5 (adaptive NUM_SEGMENTS)** — kernel gap 의 범인이 "SEGMENTS=16 하드코드" 인지 검증. **부정 결과**. Adaptive `ceil(ctx/512)` 로 바꾸면 geomean 이 오히려 1.4 pp 악화, adaptive-only 로 새로 닫는 shape 은 0 개, 작은 batch 규모 shape 에선 최대 +19.6 pp 퇴보. **16 은 small-batch occupancy multiplier 로 동작하는 rational default** 임이 확인됨.
+5. 따라서 PR scope 가 **scenario A (dispatch-only)** 로 확정됨. Kernel gap 의 주원인은 SEGMENTS 가 아니라 grid/BLOCK_M 설계일 가능성이 높음 (§6.6 가설) — 별도 track.
 
 ---
 
@@ -220,25 +221,118 @@ Kernel 동일성은 byte-diff 로도 확인 (`unified_attention.py` 본체는 up
 
 ---
 
-## 6. Next
+## 6. Stage 1.5 — Adaptive NUM_SEGMENTS variant (negative result)
 
-Stage 1 결과를 받아 판단할 것:
+Stage 1 의 끝에 남긴 의문: "`SP|3D|3D` 구간의 kernel gap 90%+ 는 SEGMENTS 하드코드 16 때문인가?" 를 검증. 4 번째 variant 추가:
 
-- **Stage 2 (vLLM e2e bench) 로 진행하는가?**
-  - 기준선 (Day 2 에서 설정): "L4 에서 realistic shape 3 개 이상에 +10% 이상 latency 차이" → **5/7 primary shape 에서 초과**. 기준 통과.
-  - 하지만 원래 plan 은 "dispatch 한 줄" 전제였음. 현재 결과 (kernel gap 이 dominant) 를 보면 Stage 2 의 e2e 기대치를 재설정해야 함 — "dispatch 만 고친 빌드" vs "ours kernel 삽입 빌드" 를 다르게 측정.
-- **Stage 1.5 (SEGMENTS adaptive 추가 bench) 를 끼워넣을까?**
-  - `vllm-smaware` variant 옆에 `vllm-smaware-adaptive-segments` 를 추가하면 4-way. `SP|3D|3D` 구간에서 어떻게 움직이는지만 봐도 "kernel gap 의 일부가 SEGMENTS 였다" 가 분리됨. 예상 작업량 0.5 일.
-  - Stage 1.5 결과가 크면 Candidate B 를 "dispatch + SEGMENTS" 패키지로 승격 후 Stage 2 로. 작으면 순수 dispatch PR 로 가고 kernel 은 별 이슈로.
+- **vllm-smaware-adaptive** — vLLM kernel + SM-aware threshold + `num_par_softmax_segments = ceil(ctx/512)` 을 `[1, 32]` 로 clamp (lesson 12 의 partition-size 규칙을 그대로 이식). Scratch tensors (`segm_output/max/expsum`) 도 그 값으로 size.
+- 2026-04-23 에 같은 VM, 같은 79 shape 로 재실행. Raw data: `bench_results/l13_candidateB_stage1_5_20260422T1505*.{csv,json}` (4-way columns 추가).
 
-- **Upstream issue drafting 시점**
-  - 권장: Stage 1.5 까지 끝낸 후, "dispatch + SEGMENTS" 의 측정치를 붙여서 issue 를 열기. 순수 dispatch-only issue 로는 maintainer 가 "이게 전부냐?" 반응할 가능성 높음.
+### 6.1 Headline
 
-### Open questions
+| metric | vllm-default | vllm-smaware | **vllm-adaptive** | ours |
+|---|---:|---:|---:|---:|
+| geomean gap vs ours (n=79) | +40.5% | +35.1% | **+36.5%** | 0 |
 
-1. `SP|3D|3D` 구간의 kernel gap 이 정확히 어디서 오는가 (SEGMENTS vs grid shape vs scratch vs flat-token)? → Stage 1.5 또는 별도 profiling (NCU) 필요.
-2. L4 의 발견이 A100/H100 에서도 같은 방향/같은 크기인가? SM count scaling 만 보면 A100 은 `128/108 ≈ 1.19×` 살짝 안 맞고, H100 은 `128/132 ≈ 0.97×` 거의 맞음. 즉 **L4 와 A100 에서는 misdispatch, H100 은 잘 맞음** 이 upstream 설계 의도였을 가능성. A100 bench 없이는 반론 못 막음.
-3. `vllm-smaware` 의 threshold 를 `num_SMs` 그대로 (우리 현재 `num_SMs // 2` 가 아니라) 썼을 때는 어떤가? Baseline 이 하나 더 있으면 threshold 함수의 민감도도 알 수 있음.
+**Adaptive 는 dispatch-fix 한 smaware 대비 1.4 pp 더 느림 (mean)**. 개선이 아니라 **퇴보**.
+
+### 6.2 Bucketing
+
+Stage 1.5 의 자동 summary (`--sweep` 79 shape):
+
+| bucket | 조건 | count |
+|---|---|---:|
+| A. dispatch-only 승 | smaware 가 ours 대비 ≤10% | 8 |
+| B. adaptive-only 승 | adaptive 가 ≤10% 인데 smaware 는 >10% | **1** (noise, sma +10.3% → adp +10.0%) |
+| C. 여전히 stuck | adaptive 로도 >10% | 64 |
+
+→ **adaptive 가 새로 닫은 shape 은 사실상 0**.
+
+### 6.3 Adaptive 가 의미 있는 구간만 분리
+
+Dispatch 가 `smaware → 2D` 로 도달하면 adaptive 도 자동으로 2D (`num_par_softmax_segments` 무시됨). 따라서 adaptive 효과가 실제로 측정되는 구간은 **smaware_path = 3D 인 31 shape** 만. 그 subset 에서:
+
+| 효과 | 기준 | count | % |
+|---|---|---:|---:|
+| adaptive 가 >2pp 빠름 | help | 2 | 6% |
+| ±2pp 이내 | tie | 21 | 68% |
+| adaptive 가 >2pp 느림 | **hurt** | 8 | 26% |
+
+**Hurt:help = 4:1**. Tied 구간 평균도 slightly negative. 정말 깨끗한 negative signal.
+
+### 6.4 Path-pattern 별 평균 (`ours | sma_path`)
+
+| bucket | n | mean g_sma | mean g_adp | adp − sma | seg range |
+|---|---:|---:|---:|---:|---|
+| `SP\|2D` | 48 | +26.6% | +26.9% | +0.2pp | [1, 8] (무의미, sma=2D) |
+| `SK\|3D` (long ctx, small batch) | 16 | +24.2% | +27.5% | **+2.8pp** | [8, 8] |
+| `SP\|3D` (short ctx, small batch) | 15 | +90.4% | +95.2% | **+2.5pp** | [2, 2] |
+
+**가장 심한 악화 5 shape** (sweep):
+
+| case | B × H_kv × ctx | seg | g_sma | g_adp | Δ |
+|---|---|---:|---:|---:|---:|
+| sweep_B02_Hkv08_Hq032_ctx4096 | 2×8×4096 | 8 | +23.3% | **+47.5%** | +19.6 pp |
+| sweep_B01_Hkv02_Hq008_ctx1024 | 1×2×1024 | 2 | +92.1% | **+129.0%** | +19.2 pp |
+| sweep_B02_Hkv04_Hq016_ctx1024 | 2×4×1024 | 2 | +92.2% | **+124.1%** | +16.6 pp |
+| sweep_B01_Hkv04_Hq016_ctx4096 | 1×4×4096 | 8 | +23.9% | +44.1% | +16.3 pp |
+| sweep_B16_Hkv01_Hq004_ctx4096 | 16×1×4096 | 8 | +23.0% | +37.6% | +11.9 pp |
+
+### 6.5 왜 16 이 더 빠른가 (hypothesis)
+
+작은 `(B, H_kv)` 에서는 outer grid `(total_q_blocks, H_kv)` 가 이미 수십 개 수준이라 SM 을 못 채움. 이 때 3D 축의 16 segments 가 **"parallelism multiplier"** 로 쓰여 점유율을 끌어올림. lesson-12 스타일의 `ceil(ctx/512) = 2` 로 줄이면 grid 가 2×작아져 오히려 under-subscribed 됨.
+
+즉 **upstream 의 16 하드코드는 "큰 batch 에선 낭비" 이기는 하나, 큰 batch 에선 dispatcher 가 이미 2D path 로 보내므로 실제로 3D 가 타는 상황 (small batch) 에서는 16 이 합리적 default**. 우리 lesson 12 의 partition-size 규칙은 `B*H_kv` 가 이미 큰 전제 하에 만들어진 것이라 이 구간엔 부적합.
+
+### 6.6 그래서 kernel gap 은 어디서 오는가?
+
+Stage 1.5 가 SEGMENTS 요인을 제거했으므로 가설이 좁혀짐:
+
+- ~~(a) 16 segments 하드코드~~ — 반증됨.
+- **(b) 남은 후보 — 순위대로:**
+  1. **Grid layout + BLOCK_M**. vLLM 의 `total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs` 과 `BLOCK_M = max(16, pow2(num_queries_per_kv))` 는 prefill/unified 를 위한 것. Decode-only shape 에서는 낭비. 우리 lesson 12 는 `(B, H_kv)` 로 더 얇게 grid.
+  2. **Flat-token `find_seq_idx`**. 블록마다 이진탐색으로 seq 인덱스를 역산. Decode 에서는 `cu_seqlens_q = arange(B+1)` 이라 trivial — 그래도 launch 당 B 번의 binary search ≠ 0.
+  3. **Backend scratch prealloc**. 우리 wrapper 에선 `torch.empty` 한 번 할당 비용만 측정되지만, upstream backend 는 steady state 이후 재사용. 이 항목은 측정 영향 ≈ 0 으로 가정해도 무방. 미확인.
+  4. **Causal mask + softcap path**. Decode 의 경우 `causal=True` 라도 Q_len=1 이라 mask 는 trivial. 우리 커널은 이 사실을 compile-time 으로 knows. upstream 은 일반 prefill 케이스와 같은 branch.
+
+Hypothesis (1) 이 가장 유력. 확인하려면 ours 의 grid 를 vLLM 풍 `(total_q_blocks, H_kv)` 로 재작성해서 bench → 기대: gap 상당 부분 줄어듦. 이건 "Stage 1.75" 혹은 별도 실험.
+
+### 6.7 Stage 1.5 의 PR 함의
+
+Stage 1 이후 고민했던 3 개 시나리오 (A/B/C) 중:
+
+- **A. Dispatch-only PR** — 유효. 8 shape 에서 10% 이내 회복, 나머지에도 평균 +5.4 pp 개선 (geomean 40.5% → 35.1%). **regression 없음**. L4/A100 유저에게 순수 이득.
+- **B. Dispatch + SEGMENTS adaptive PR** — **철회**. Stage 1.5 로 SEGMENTS 는 오히려 regression 유발 (8 shape 에서 2-20pp 악화) 확인. 섞어서 PR 내면 maintainer 가 "이 부분은 measurements 가 하락시키네요" 로 reject 가능.
+- **C. Kernel 재작성 PR** — scope 커져서 별도 track. Stage 1.5 가 "grid/BLOCK_M 이 주원인" 으로 가설을 좁혀주긴 했음.
+
+**결론**: upstream issue 는 **A 만 가지고 open**. Stage 1.5 의 adaptive-SEGMENTS 는 "이 방향은 시도했으나 data 가 부정적" 이라는 단서로만 언급 (본 문서 링크). 이렇게 하면:
+
+- PR 자체는 100% 안전 (regression 없음, 작은 diff, 설명 간단)
+- Reviewer 가 "kernel gap 도 보세요" 하면 "그건 별 문제이고 probe 도 했으며 하는 중" 이라 응대 가능
+
+### 6.8 Stage 2 기준선 재조정
+
+원래 기준: "L4 에서 realistic shape 3+ 에서 +10% 이상 gap" → **여전히 통과 (5/7 primary)**. Stage 2 로 진행.
+
+하지만 Stage 2 (vLLM e2e) 의 기대치:
+- "dispatch-only 패치" 를 적용한 vLLM 빌드 vs 순정 빌드: 기대 e2e 개선 **1-5% 수준** (geomean 5.4pp 는 per-attention-call; e2e 에서는 attention 비중에 희석됨).
+- 그 수준이면 PR 가치는 충분하나 헤드라인 "wow" 숫자는 아님. 본 PR 의 value proposition 은 "noise 수준이 아닌, 부수효과 없는, 데이터로 검증된 한 줄 수정" 이 되어야 함.
+
+---
+
+## 7. Next
+
+- **확정**: 시나리오 A 로 upstream issue 드래프트. scope 는 `triton_attn.py:163` 의 `128` 을 `max(128, num_sms) // max(H_kv, 1)` 같은 SM-aware 로 대체. 증거 첨부: 본 문서 §2 table + §3.2 table + §6.1 table.
+- **판단 필요**: Stage 2 (vLLM 서버 e2e bench) 를 바로 진행하는가, 아니면 issue 먼저 열어 maintainer 반응 본 후 결정하는가?
+  - **권장: issue 먼저.** e2e 세팅은 시간이 많이 들고 (vLLM 서버 + 클라이언트 + 모델 다운로드 + 워크로드), maintainer 가 "L4 는 우리 타겟 아님" 이라고 답하면 Stage 2 를 버려야 함. Issue → 반응 양호 → Stage 2 순.
+- **Optional**: Stage 1.75 (grid/BLOCK_M 차이가 kernel gap 의 주원인인지 한 실험으로 확인). Stage 2 e2e 에 의존적이지 않으므로 병렬로 진행 가능. 가치: 추후 kernel PR 의 근거.
+
+### Open questions (updated)
+
+1. ~~`SP|3D|3D` 구간의 kernel gap 이 SEGMENTS 때문인가~~ — **아니오** (§6).
+2. L4 의 발견이 A100/H100 에서도 같은 방향/같은 크기인가? — 미해결. Dispatch-only PR 설명에 "L4 에서 관측; A100 은 `128/(108/2) ≈ 2.4x` 이므로 threshold 도 같은 방향으로 underfit 가능성. H100 은 `128/(132/2) ≈ 1.9x`, 경계. 재현 가능한 bench script 첨부." 로 프레이밍.
+3. SM-aware threshold 의 구체적 공식 — `(num_SMs // 2) // H_kv` 는 우리가 임의로 정한 값. `num_SMs // H_kv` 나 `num_SMs * 3 // 4 // H_kv` 같은 다른 식도 실험해볼 가치. PR 전에 sensitivity 측정 짧게 추가 권장.
+4. Grid/BLOCK_M 이 kernel gap 의 주원인인지 (Stage 1.75 질문).
 
 ---
 
@@ -247,6 +341,7 @@ Stage 1 결과를 받아 판단할 것:
 - Audit Day 1-2: [`docs/vllm_audit_01_attention_path.md`](/Users/xavier/dev/cudatraining/docs/vllm_audit_01_attention_path.md:1)
 - Stage 1 kernel 추출: [`triton_kernels/vllm_extracted/unified_attention.py`](/Users/xavier/dev/cudatraining/triton_kernels/vllm_extracted/unified_attention.py:1), [`NOTICE.md`](/Users/xavier/dev/cudatraining/triton_kernels/vllm_extracted/NOTICE.md:1)
 - Bench harness: [`triton_kernels/bench/bench_vllm_vs_ours.py`](/Users/xavier/dev/cudatraining/triton_kernels/bench/bench_vllm_vs_ours.py:1)
-- Raw data: `bench_results/l13_candidateB_stage1_20260422T140813Z.{csv,json}` (primary 7), `bench_results/l13_candidateB_stage1_20260422T140953Z_sweep.{csv,json}` (primary 7 + sweep 72)
+- Raw data (Stage 1, 3-way): `bench_results/l13_candidateB_stage1_20260422T140813Z.{csv,json}` (primary 7), `bench_results/l13_candidateB_stage1_20260422T140953Z_sweep.{csv,json}` (primary 7 + sweep 72)
+- Raw data (Stage 1.5, 4-way with adaptive SEGMENTS): `bench_results/l13_candidateB_stage1_5_20260422T150508Z.{csv,json}` (primary 7), `bench_results/l13_candidateB_stage1_5_20260422T150631Z_sweep.{csv,json}` (primary 7 + sweep 72)
 - Lesson 11 (paged attention vLLM v0 audit): [`docs/blog_draft_lesson_11_paged_attention.md`](/Users/xavier/dev/cudatraining/docs/blog_draft_lesson_11_paged_attention.md:1)
 - Lesson 12 (split-k + auto-dispatch origin): [`docs/blog_draft_lesson_12_split_k.md`](/Users/xavier/dev/cudatraining/docs/blog_draft_lesson_12_split_k.md:1)
