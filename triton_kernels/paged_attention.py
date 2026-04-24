@@ -421,8 +421,8 @@ def triton_paged_attention_decode(
         use_split_k:
             True  → always use split-k path (diagnostic).
             False → always single-pass.
-            None  → auto: split-k when (B*H_kv < 0.75*SM_COUNT) and
-                    ctx > 1.5 * partition_size.
+            None  → auto: split-k when (B*H_kv < 0.5*SM_COUNT) and
+                    segments >= 4.
         partition_size: tokens per segment for split-k. Must divide
             block_size evenly. Default 512 (vLLM v2 default).
 

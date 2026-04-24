@@ -153,7 +153,7 @@ selector.get_attn_backend(head_size, dtype, ...)
 
 | 측면 | 우리 (lesson 12) | vLLM unified |
 |---|---|---|
-| split-k 결정 | `B*H_kv < 0.5*SM ∧ segments ≥ 4` — **SM utilization 중심** | `num_seqs > 128/num_kv_heads` — **batch-count 중심** |
+| split-k 결정 | `B*H_kv < 0.5*SM ∧ segments ≥ 4` — **SM utilization 중심** | `num_seqs ≤ 128/num_kv_heads` (즉 `B*H_kv ≤ 128`) → 3D split-k, 그 외엔 2D single-pass — **batch-count 중심** |
 | SEGMENTS | `ceil(ctx / PARTITION_SIZE)` — **ctx 적응형** | **16 hardcoded** — 짧은 ctx 에선 낭비, 긴 ctx 에선 부족 |
 | Reduce kernel | 별도 파일 (`paged_attention.py` 안 나란히) | 같은 파일 inline (`reduce_segments`) |
 | Prefill 통합 | ❌ (decode only) | ✅ (한 kernel) |
@@ -206,7 +206,7 @@ Day 1-2 결과를 다시 읽었을 때 판단: 원래 Day 3-5 의 "platforms/cud
   ```
   → `ops/triton_unified_attention.py:1157-1166` 의 `num_seqs > seq_threshold_3D` 분기에서 2D(single-pass) vs 3D(split-k) 결정.
   → 동치: `B * H_kv > 128 → single-pass`, `B * H_kv ≤ 128 → split-k`.
-- 이 `128` 은 magic number. SM 수에 따라 scale 되어야 할 값인데 HW-agnostic 고정상수.
+- 이 `128` 은 magic number 가 아니라 **`triton_attn.py:49` 의 `MIN_LAUNCH_GRID_SIZE_2D = 128` 이라는 의도된 상수** (PR #28306 에 명시: "Minimum launch grid size of 2D kernel"). 즉 "2D 커널이 점유율을 채우려면 grid 가 최소 128 이상이어야 한다" 는 가정을 깔고 있다 — A100 (108 SM) / H100 (132 SM) 에 맞춘 anchor. 문제는 이 anchor 가 **GPU 의 실제 SM count 와 분리되어 있다** (HW-agnostic) 는 점이지, 값 자체가 임의 (arbitrary) 이지는 않다. 게다가 `triton_attn.py:166-176` 의 CUDA graph capture-size snapping (역시 PR #28306) 이 raw threshold 를 capture size grid 에 맞춰 한 번 더 보정한다 — 이 메커니즘은 직교적이고 우리 patch 와 무관.
 - GPU 별 SM 수:
   - L4: **58 SMs** (우리 타겟)
   - A100: 108 SMs

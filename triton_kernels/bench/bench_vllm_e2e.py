@@ -11,19 +11,20 @@ We run vLLM offline batching with a decode-heavy workload (short prompt,
 long generation) on a model that lands its (B * H_kv) values squarely in
 the regime where Stage 1 showed upstream dispatch misfires.
 
-Two binaries are compared:
-  1. vllm_vanilla   — pip-installed vLLM, unpatched.
-  2. vllm_smaware   — same binary with one-line patch at
-                      vllm/v1/attention/backends/triton_attn.py:163
-                      replacing `seq_threshold_3D = 128 // num_kv_heads`
-                      with `seq_threshold_3D = max(num_sms // 2, 1) // num_kv_heads`.
+Two installed-tree states are compared:
+  1. vanilla   — pip-installed vLLM, unpatched.
+  2. smaware   — same install tree with one-line patch at
+                 vllm/v1/attention/backends/triton_attn.py:163
+                 replacing `seq_threshold_3D = 128 // num_kv_heads`
+                 with `seq_threshold_3D = max(num_sms // 2, 1) // num_kv_heads`.
 
-The two are selected by environment variable `VLLM_PATCHED=0|1` which this
-script consumes via a side helper that (de)applies the patch against the
-installed source tree. We assume the user runs:
+This script does not patch vLLM by itself. Use scripts/toggle_vllm_patch.py
+between runs, then stamp the matching state with --variant:
 
     source ~/vllm-venv/bin/activate
+    python scripts/toggle_vllm_patch.py --mode vanilla --yes
     python -m triton_kernels.bench.bench_vllm_e2e --variant vanilla --tag stage2_<ts>
+    python scripts/toggle_vllm_patch.py --mode smaware --yes
     python -m triton_kernels.bench.bench_vllm_e2e --variant smaware --tag stage2_<ts>
 
 so the patch-state of the installed tree matches the `--variant`.
@@ -34,12 +35,12 @@ Output: CSV + JSON to bench_results/ with:
   - tokens_per_sec
   - per-variant mean/median/stdev
 
-Workload (decode-heavy, small-batch, long ctx):
-  - model    : meta-llama/Llama-3.2-3B-Instruct
-               (H_q=24, H_kv=8, d_head=128 → GQA-3, B*H_kv ∈ [8, 32] for B ∈ {1, 2, 4})
-  - prompt   : 32-token English instruction template
-  - max_tok  : 512 new tokens
-  - batch    : 1, 2, 4 sequences (iterates through batches)
+Default workload (decode-heavy, short-context):
+  - model    : TinyLlama/TinyLlama-1.1B-Chat-v1.0
+               (H_q=32, H_kv=4, d_head=64)
+  - prompt   : short English instruction template
+  - max_tok  : 256 new tokens
+  - batch    : 8, 16, 32 sequences (iterates through batches)
 
 This exercises the SP|3D|2D / SK|3D|3D buckets where Stage 1 showed
 >20% per-call regression. Expectation: e2e tokens/sec improves by a more
@@ -62,7 +63,7 @@ from datetime import datetime, timezone
 # vLLM is heavy — import lazily so --help is snappy.
 
 
-DEFAULT_MODEL = "meta-llama/Llama-3.2-3B-Instruct"
+DEFAULT_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 DEFAULT_PROMPT = (
     "You are a concise assistant. Continue the following text with a "
     "single paragraph of around 200 words, staying on topic. Topic: "
@@ -181,12 +182,12 @@ def main():
     ap.add_argument("--variant", choices=("vanilla", "smaware"), required=True,
                     help="which vLLM build is currently installed. This script does "
                          "NOT modify the installed tree — use the separate "
-                         "scripts/toggle_vllm_patch.sh for that. The flag is "
+                         "scripts/toggle_vllm_patch.py for that. The flag is "
                          "stamped on the output for bookkeeping.")
     ap.add_argument("--model", default=DEFAULT_MODEL)
-    ap.add_argument("--batches", type=int, nargs="+", default=[1, 2, 4],
+    ap.add_argument("--batches", type=int, nargs="+", default=[8, 16, 32],
                     help="batch sizes to iterate")
-    ap.add_argument("--max-new-tokens", type=int, default=512)
+    ap.add_argument("--max-new-tokens", type=int, default=256)
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--dtype", default="float16")
