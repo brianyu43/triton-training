@@ -11,6 +11,13 @@ bench_results/
 **/checkpoints/
 **/wandb/
 
+# NanoTriton-LM generated data and fetched external references.
+nanotriton-lm/data/**/input.txt
+nanotriton-lm/data/**/*.bin
+nanotriton-lm/data/**/meta.json
+nanotriton-lm/references/*/
+!nanotriton-lm/references/MANIFEST.md
+
 # macOS
 .DS_Store
 **/.DS_Store
