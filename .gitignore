@@ -1,9 +1,15 @@
 bin/
 build/
 results/
+bench_results/
 *.o
 *.out
 *.csv
+
+# Project-local generated outputs
+**/out/
+**/checkpoints/
+**/wandb/
 
 # macOS
 .DS_Store
