@@ -18,9 +18,9 @@ Implemented:
 Current implementation detail:
 
 - `dx` is computed in Triton.
-- `dweight` is produced as row-wise fp32 partials from Triton and reduced with PyTorch `sum(dim=0)`.
+- `dweight` is computed with Triton row-wise fp32 partials and a two-stage Triton reduction.
 
-This keeps the milestone stable while leaving a clear future optimization target: a fully Triton `dweight` reduction.
+This means RMSNorm backward no longer relies on PyTorch for the final parameter-gradient reduction.
 
 ## Backward Formula
 
@@ -48,14 +48,14 @@ Checks:
 ```text
 python3 -m compileall -q nanotriton data scripts benchmarks tests
 pytest -q
-bash -n scripts/gcp_copy_project_to_vm.sh scripts/gcp_run_milestone1_smoke.sh scripts/gcp_run_milestone2_kernels.sh scripts/gcp_run_milestone3_rmsnorm_backward.sh
+bash -n scripts/gcp_copy_project_to_vm.sh scripts/gcp_run_milestone1_smoke.sh scripts/gcp_run_milestone2_kernels.sh scripts/gcp_run_milestone3_rmsnorm_backward.sh scripts/gcp_run_milestone4_triton_rmsnorm_model.sh
 git diff --check
 ```
 
 Result:
 
 ```text
-s.. [100%]
+ss.. [100%]
 ```
 
 CUDA tests are skipped locally because torch/triton are not installed.
@@ -119,16 +119,16 @@ Result:
 
 ```json
 {
-  "speedup": 1.3937598075148616,
+  "speedup": 1.288237701537218,
   "torch_ms": {
-    "median_ms": 0.7536344999969913
+    "median_ms": 0.7255489999984377
   },
   "triton_ms": {
-    "median_ms": 0.5407204999983151
+    "median_ms": 0.563210499997524
   }
 }
 ```
 
-Interpretation: this is a first forward+backward smoke benchmark, not a final performance claim. The result is already faster than the PyTorch eager reference for this training shape on L4, while still leaving `dweight` reduction as an optimization target.
+Interpretation: this is a first forward+backward smoke benchmark, not a final performance claim. The result is already faster than the PyTorch eager reference for this training shape on L4, and the parameter-gradient reduction is now fully in the Triton path.
 
 The VM was stopped after validation.

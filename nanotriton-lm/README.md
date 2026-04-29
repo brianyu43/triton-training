@@ -81,5 +81,17 @@ RMSNorm backward and autograd smoke results are in
 ./scripts/gcp_run_milestone3_rmsnorm_backward.sh nemo-488500 us-central1-a pxr-chemprop-l4-image-run
 ```
 
-Current status: RMSNorm now has Triton forward/backward kernels, an autograd
-function, and an `nn.Module` wrapper.
+Current status: RMSNorm now has Triton forward/backward kernels, a fully Triton
+`dweight` reduction path, an autograd function, and an `nn.Module` wrapper.
+
+## Milestone 4: Triton RMSNorm Model Integration
+
+Model-level loss regression results are in
+[docs/milestone4_triton_rmsnorm_model_2026-04-29.md](docs/milestone4_triton_rmsnorm_model_2026-04-29.md).
+
+```bash
+./scripts/gcp_run_milestone4_triton_rmsnorm_model.sh nemo-488500 us-central1-a pxr-chemprop-l4-image-run 120
+```
+
+Current status: GPT training can run with PyTorch RMSNorm or Triton RMSNorm via
+`ModelConfig.norm_impl`, and the 120-step Tiny Shakespeare loss curves match.

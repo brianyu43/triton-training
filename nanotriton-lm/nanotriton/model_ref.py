@@ -21,6 +21,18 @@ class RMSNorm(nn.Module):
         return (normed.to(dtype=x.dtype) * self.weight).to(dtype=x.dtype)
 
 
+def _norm_cls(config: ModelConfig):
+    if config.norm_type != "rmsnorm":
+        raise ValueError("NanoTriton-LM currently supports norm_type=rmsnorm")
+    if config.norm_impl == "torch":
+        return RMSNorm
+    if config.norm_impl == "triton":
+        from nanotriton.modules.norm import TritonRMSNorm
+
+        return TritonRMSNorm
+    raise ValueError(f"Unknown norm_impl={config.norm_impl!r}; expected 'torch' or 'triton'")
+
+
 class SwiGLU(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -67,13 +79,12 @@ class CausalSelfAttention(nn.Module):
 class Block(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
-        if config.norm_type != "rmsnorm":
-            raise ValueError("Milestone 1 reference stack currently supports norm_type=rmsnorm")
         if config.mlp_type != "swiglu":
             raise ValueError("Milestone 1 reference stack currently supports mlp_type=swiglu")
-        self.norm_1 = RMSNorm(config.n_embd)
+        norm_cls = _norm_cls(config)
+        self.norm_1 = norm_cls(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.norm_2 = RMSNorm(config.n_embd)
+        self.norm_2 = norm_cls(config.n_embd)
         self.mlp = SwiGLU(config)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -88,13 +99,14 @@ class GPT(nn.Module):
         if config.vocab_size <= 0:
             raise ValueError("vocab_size must be set before constructing GPT")
         self.config = config
+        norm_cls = _norm_cls(config)
         self.transformer = nn.ModuleDict(
             {
                 "wte": nn.Embedding(config.vocab_size, config.n_embd),
                 "wpe": nn.Embedding(config.block_size, config.n_embd),
                 "drop": nn.Dropout(config.dropout),
                 "h": nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-                "ln_f": RMSNorm(config.n_embd),
+                "ln_f": norm_cls(config.n_embd),
             }
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)

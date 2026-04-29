@@ -17,6 +17,7 @@ class ModelConfig:
     dropout: float = 0.0
     bias: bool = False
     norm_type: str = "rmsnorm"
+    norm_impl: str = "torch"
     mlp_type: str = "swiglu"
 
 
