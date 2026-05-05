@@ -1,0 +1,43 @@
+Generating SQLite file nsys_mm.sqlite from nsys_mm.nsys-rep
+Processing [nsys_mm.sqlite] with [/usr/local/cuda-12.9/nsight-systems-2025.1.3/host-linux-x64/reports/cuda_gpu_kern_sum.py]... 
+
+ ** CUDA GPU Kernel Summary (cuda_gpu_kern_sum):
+
+ Time (%)  Total Time (ns)  Instances  Avg (ns)  Med (ns)  Min (ns)  Max (ns)  StdDev (ns)                                                  Name                                                
+ --------  ---------------  ---------  --------  --------  --------  --------  -----------  ----------------------------------------------------------------------------------------------------
+     94.7          3739461          5  747892.2  747867.0    747291    748475        461.2  ampere_fp16_s16816gemm_fp16_256x128_ldg8_f2f_stages_64x3_nn                                         
+      5.3           209567          2  104783.5  104783.5     93280    116287      16268.4  void at::native::<unnamed>::distribution_elementwise_grid_stride_kernel<float, (int)4, void at::nat…
+
+Processing [nsys_mm.sqlite] with [/usr/local/cuda-12.9/nsight-systems-2025.1.3/host-linux-x64/reports/cuda_api_sum.py]... 
+
+ ** CUDA API Summary (cuda_api_sum):
+
+ Time (%)  Total Time (ns)  Num Calls  Avg (ns)   Med (ns)   Min (ns)  Max (ns)  StdDev (ns)                   Name                  
+ --------  ---------------  ---------  ---------  ---------  --------  --------  -----------  ---------------------------------------
+     89.5         47480477         15  3165365.1  1993755.0    928155   7072343    2169356.9  cuLibraryLoadData                      
+      6.5          3438460          5   687692.0   707260.0     16473   1307047     456917.0  cudaDeviceSynchronize                  
+      2.0          1067182          7   152454.6    20483.0     10412    936179     345731.3  cudaLaunchKernel                       
+      1.3           716007          7   102286.7   110214.0      4481    157145      51556.6  cudaMalloc                             
+      0.3           156704        880      178.1      155.5        89       951         80.1  cuGetProcAddress_v2                    
+      0.1            41333          6     6888.8     5386.5      3946     14696       3939.6  cudaEventRecordWithFlags_v11010        
+      0.1            37363         24     1556.8      418.0       373     10886       2605.2  cudaEventCreateWithFlags               
+      0.1            33599         15     2239.9      691.0       422      5792       2335.5  cuLibraryGetKernel                     
+      0.1            29730          1    29730.0    29730.0     29730     29730          0.0  cudaFree                               
+      0.0            25527         14     1823.4     1007.0       294     10854       2687.1  cudaStreamIsCapturing_v10000           
+      0.0             9914          6     1652.3      733.5       416      6584       2424.5  cudaEventDestroy                       
+      0.0             9817          6     1636.2     1439.5       872      3247        929.2  cudaEventQuery                         
+      0.0             6809          4     1702.3     1840.5      1101      2027        413.0  cuInit                                 
+      0.0             3157          7      451.0      515.0       185       740        189.0  cuKernelGetName                        
+      0.0             2860          3      953.3      642.0       582      1636        592.0  cudaGetDriverEntryPointByVersion_v12050
+      0.0             1072          3      357.3      151.0       110       811        393.4  cuModuleGetLoadingMode                 
+      0.0              919          2      459.5      459.5       225       694        331.6  cudaGetDeviceProperties_v2_v12000      
+
+Processing [nsys_mm.sqlite] with [/usr/local/cuda-12.9/nsight-systems-2025.1.3/host-linux-x64/reports/nvtx_sum.py]... 
+
+ ** NVTX Range Summary (nvtx_sum):
+
+ Time (%)  Total Time (ns)  Instances  Avg (ns)   Med (ns)   Min (ns)  Max (ns)  StdDev (ns)   Style           Range         
+ --------  ---------------  ---------  ---------  ---------  --------  --------  -----------  -------  ----------------------
+     86.5          2888171          1  2888171.0  2888171.0   2888171   2888171          0.0  PushPop  cuBLAS:cublasCreate_v2
+     13.5           450379          3   150126.3   125982.0    118218    206179      48698.0  PushPop  :mm                   
+
