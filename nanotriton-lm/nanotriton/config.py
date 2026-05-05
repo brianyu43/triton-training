@@ -19,6 +19,7 @@ class ModelConfig:
     norm_type: str = "rmsnorm"
     norm_impl: str = "torch"
     mlp_type: str = "swiglu"
+    mlp_impl: str = "torch"
 
 
 @dataclass

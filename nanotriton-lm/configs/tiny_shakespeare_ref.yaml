@@ -32,3 +32,4 @@ model:
   norm_type: rmsnorm
   norm_impl: torch
   mlp_type: swiglu
+  mlp_impl: torch

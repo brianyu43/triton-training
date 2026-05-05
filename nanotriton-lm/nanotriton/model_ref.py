@@ -36,6 +36,9 @@ def _norm_cls(config: ModelConfig):
 class SwiGLU(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
+        if config.mlp_impl not in {"torch", "triton_swiglu"}:
+            raise ValueError(f"Unknown mlp_impl={config.mlp_impl!r}; expected 'torch' or 'triton_swiglu'")
+        self.mlp_impl = config.mlp_impl
         hidden_dim = 4 * config.n_embd
         self.w1 = nn.Linear(config.n_embd, hidden_dim, bias=config.bias)
         self.w3 = nn.Linear(config.n_embd, hidden_dim, bias=config.bias)
@@ -43,7 +46,15 @@ class SwiGLU(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+        a = self.w1(x)
+        b = self.w3(x)
+        if self.mlp_impl == "torch":
+            hidden = F.silu(a) * b
+        else:
+            from nanotriton.autograd.swiglu_fn import triton_swiglu
+
+            hidden = triton_swiglu(a, b)
+        return self.dropout(self.w2(hidden))
 
 
 class CausalSelfAttention(nn.Module):

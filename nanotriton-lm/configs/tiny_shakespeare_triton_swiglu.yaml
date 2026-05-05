@@ -2,7 +2,7 @@ seed: 1337
 device: auto
 dtype: float16
 compile: false
-out_dir: out/tiny_shakespeare_triton_rmsnorm
+out_dir: out/tiny_shakespeare_triton_swiglu
 eval_interval: 100
 log_interval: 10
 eval_iters: 20
@@ -30,6 +30,6 @@ model:
   dropout: 0.0
   bias: false
   norm_type: rmsnorm
-  norm_impl: triton
+  norm_impl: torch
   mlp_type: swiglu
-  mlp_impl: torch
+  mlp_impl: triton_swiglu

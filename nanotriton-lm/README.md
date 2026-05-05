@@ -95,3 +95,30 @@ Model-level loss regression results are in
 
 Current status: GPT training can run with PyTorch RMSNorm or Triton RMSNorm via
 `ModelConfig.norm_impl`, and the 120-step Tiny Shakespeare loss curves match.
+
+## Milestone 5: Standalone SwiGLU
+
+Standalone SwiGLU forward/backward results are in
+[docs/milestone5_swiglu_2026-04-29.md](docs/milestone5_swiglu_2026-04-29.md).
+
+```bash
+./scripts/gcp_run_milestone5_swiglu.sh nemo-488500 us-central1-a pxr-chemprop-l4-image-run
+```
+
+Current status: SwiGLU standalone correctness passes, but the isolated Triton
+op is slower than PyTorch eager on L4. The next useful target is MLP integration
+and then broader fusion.
+
+## Milestone 6: Triton SwiGLU Model Integration
+
+Model-level loss regression results are in
+[docs/milestone6_triton_swiglu_model_2026-04-29.md](docs/milestone6_triton_swiglu_model_2026-04-29.md).
+
+```bash
+./scripts/gcp_run_milestone6_triton_swiglu_model.sh nemo-488500 us-central1-a pxr-chemprop-l4-image-run 120
+```
+
+Current status: GPT training can run with PyTorch SwiGLU or standalone Triton
+SwiGLU via `ModelConfig.mlp_impl`. The 120-step Tiny Shakespeare loss curves
+match, but this is still a correctness milestone rather than an end-to-end
+speedup milestone.
