@@ -299,7 +299,7 @@ The active L4 ranked submission is `submissions/v4_bigshape_cache_hint.py`, whic
 
 The active A100 ranked submission is `submissions/a100/a100_v0_safe.py`, which reached A100 rank 2 at `634.197 us` with submission `780614`. The gap to A100 rank 1 is `4.437 us` (`0.70%`), so the next A100 work should be a narrow rank-1 attack:
 
-1. Re-submit `a100_v0_safe.py` only if the board moves or variance suggests a better sample is possible.
+1. Keep `a100_v0_safe.py` as the active ranked submission; `a100_v1_aten_mm_out.py` was benchmarked and ranked after cooldown but scored worse (`660 us`, submission `780623`).
 2. Investigate whether direct cuBLAS/cuBLASLt can remove PyTorch dispatch overhead or force the best GEMM algorithm.
 3. Try a minimal compiled extension only if the GPUMODE environment allows it without setup overhead inside the timed region.
 4. Avoid broad Triton tile sweeps unless a new kernel family can plausibly beat cuBLAS on A100.

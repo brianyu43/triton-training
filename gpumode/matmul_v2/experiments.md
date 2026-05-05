@@ -186,14 +186,14 @@ Gap to A100 rank 1 is about `4.437 us`, or `0.70%`. That is small enough that th
 
 Thin A100 API variants created after rank 2:
 
-| File | Idea | Official test | Official benchmark |
-| --- | --- | --- | --- |
-| `submissions/a100/a100_v1_return_mm.py` | `return torch.mm(a, b, out=c)` | pass | pending |
-| `submissions/a100/a100_v1_matmul_out.py` | `return torch.matmul(a, b, out=c)` | pass | pending |
-| `submissions/a100/a100_v1_addmm_out.py` | `return torch.addmm(c, a, b, beta=0, out=c)` | pass | pending |
-| `submissions/a100/a100_v1_aten_mm_out.py` | direct `torch.ops.aten.mm.out` | pass | pending |
+| File | Idea | Official test | Official benchmark | Official ranked |
+| --- | --- | --- | ---: | ---: |
+| `submissions/a100/a100_v1_return_mm.py` | `return torch.mm(a, b, out=c)` | pass, `780615` | `706 us`, `780620` | not submitted |
+| `submissions/a100/a100_v1_matmul_out.py` | `return torch.matmul(a, b, out=c)` | pass, `780616` | `699 us`, `780621` | not submitted |
+| `submissions/a100/a100_v1_addmm_out.py` | `return torch.addmm(c, a, b, beta=0, out=c)` | pass, `780617` | `698 us`, `780622` | not submitted |
+| `submissions/a100/a100_v1_aten_mm_out.py` | direct `torch.ops.aten.mm.out` | pass, `780618` | `693 us`, `780619` | `660 us`, `780623` |
 
-Benchmarking these variants is blocked by the GPUMODE hourly submission limit (`6/6` submissions used). Resume with benchmark mode after the cooldown instead of spending more submissions on new ideas.
+Decision after cooldown run: `aten_mm` was the best thin API candidate in benchmark mode, so it received one ranked submission. It did not beat the existing `a100_v0_safe.py` ranked score (`634.197 us`); the run scored about `660 us` with a best sample of `636 us` and a long-tail slow sample. Keep `a100_v0_safe.py` as the active A100 ranked submission.
 
 ## A100 cuBLAS Path Analysis
 
