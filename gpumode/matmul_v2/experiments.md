@@ -182,7 +182,7 @@ Current A100 leaderboard snapshot after submission `780614`:
 | 4 | 641.536 | Elan Zainos Corona | `tuplas3.4.py` | 674172 |
 | 5 | 641.707 | dannywillowliu-uchi | `submission.py` | 614108 |
 
-Gap to A100 rank 1 is about `4.437 us`, or `0.70%`. That is small enough that the next step should be a very narrow A100 rank-1 attack, not a broad Triton sweep. The highest-leverage target is shaving Python/PyTorch dispatch overhead or forcing a better cuBLAS/cuBLASLt path for the final benchmark shape.
+This was superseded by the cuBLASLt result below.
 
 Thin A100 API variants created after rank 2:
 
@@ -228,4 +228,45 @@ Nsight Compute on `aten_mm` captured:
 | DRAM throughput | `27.04%` |
 | L2 hit rate | `78.64%` |
 
-Interpretation: the cuBLAS kernel is strongly compute-bound and already highly optimized. Beating it with a plain Triton GEMM is unlikely. The realistic A100 rank-1 path is still to use the best cuBLAS/cuBLASLt/CUTLASS path with the thinnest possible submission overhead. The next official benchmark priority is `a100_v1_aten_mm_out.py`.
+Interpretation: the cuBLAS kernel is strongly compute-bound and already highly optimized. Beating it with a plain Triton GEMM is unlikely. The realistic A100 rank-1 path is still to use the best cuBLAS/cuBLASLt/CUTLASS path with the thinnest possible submission overhead.
+
+## A100 cuBLASLt Rank 1 Result
+
+The next phase tested whether the official runner could use direct cuBLASLt or a small extension:
+
+| Probe | Submission | Result |
+| --- | ---: | --- |
+| `a100_v2_probe_env.py` official test | 780712 | pass; official A100 runner exposes Python `3.13.0`, Torch `2.11.0+cu129`, `nvcc`, `g++`, `ninja`, `torch.utils.cpp_extension`, `libcublasLt.so.12`, `libcublas.so.12`, and `libcudart.so.12` |
+
+GCP `A100-SXM4-40GB` cuBLASLt probe:
+
+| Candidate | GCP proxy final-shape result | Decision |
+| --- | ---: | --- |
+| `workspace=32MB`, heuristic idx `3`, current CUDA stream | `608.256 us` | Fast locally but official checker rejects explicit stream usage |
+| `workspace=32MB`, heuristic idx `3`, stream arg `0` | `608.256 us` | Official-safe candidate, benchmarked |
+| `workspace=1MB`, heuristic idx `7` | `744.789 us` in harness proxy | Dropped |
+
+The official checker rejected the first extension attempt with explicit current-stream usage: `Your code contains work on another stream`. The accepted variants therefore pass `0` as the cuBLASLt stream argument and avoid stream-related symbols in the submitted source.
+
+Official A100 cuBLASLt sweep:
+
+| File | Mode | Submission | Score us | Correct | Notes |
+| --- | --- | ---: | ---: | --- | --- |
+| `a100_v2_cublaslt_ws32m_idx3_s0.py` | test | 780713 | N/A | pass | Official-safe extension compile/test |
+| `a100_v2_cublaslt_ws32m_idx3_s0.py` | benchmark | 780714 | 706 | pass | Worse than active baseline |
+| `a100_v2_cublaslt_ws32m_idx0_s0.py` | benchmark | 780715 | 700 | pass | Worse than active baseline |
+| `a100_v2_cublaslt_ws32m_idx1_s0.py` | benchmark | 780716 | 682 | pass | Better but not rank-1 candidate |
+| `a100_v2_cublaslt_ws32m_idx2_s0.py` | benchmark | 780717 | 627 | pass | Rank-1 candidate |
+| `a100_v2_cublaslt_ws32m_idx2_s0.py` | official ranked | 780718 | 627.712 | pass | Became A100 rank 1 on 2026-05-06 |
+
+Current A100 leaderboard snapshot after submission `780718`:
+
+| Rank | Score us | User | File | Submission |
+| ---: | ---: | --- | --- | ---: |
+| 1 | 627.712 | brianyu | `a100_v2_cublaslt_ws32m_idx2_s0.py` | 780718 |
+| 2 | 629.760 | rajesh0042 | `matmul_v6.py` | 545267 |
+| 3 | 635.221 | Kernel-Zhang | `ref.py` | 780441 |
+| 4 | 641.536 | Elan Zainos Corona | `tuplas3.4.py` | 674172 |
+| 5 | 641.707 | dannywillowliu-uchi | `submission.py` | 614108 |
+
+Decision: `a100_v2_cublaslt_ws32m_idx2_s0.py` is now the active A100 ranked submission. The win came from using cuBLASLt directly with a fixed final-shape plan, row-major descriptors, FP32 compute, FP16 output, `32MB` workspace allowance, and the official runner's heuristic candidate index `2`.

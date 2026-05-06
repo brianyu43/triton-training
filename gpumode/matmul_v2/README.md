@@ -297,12 +297,16 @@ Per-shape table:
 
 The active L4 ranked submission is `submissions/v4_bigshape_cache_hint.py`, which reached L4 rank 1 at `2076.331 us`.
 
-The active A100 ranked submission is `submissions/a100/a100_v0_safe.py`, which reached A100 rank 2 at `634.197 us` with submission `780614`. The gap to A100 rank 1 is `4.437 us` (`0.70%`), so the next A100 work should be a narrow rank-1 attack:
+The active A100 ranked submission is `submissions/a100/a100_v2_cublaslt_ws32m_idx2_s0.py`, which reached A100 rank 1 at `627.712 us` with submission `780718`.
 
-1. Keep `a100_v0_safe.py` as the active ranked submission; `a100_v1_aten_mm_out.py` was benchmarked and ranked after cooldown but scored worse (`660 us`, submission `780623`).
-2. Investigate whether direct cuBLAS/cuBLASLt can remove PyTorch dispatch overhead or force the best GEMM algorithm.
-3. Try a minimal compiled extension only if the GPUMODE environment allows it without setup overhead inside the timed region.
-4. Avoid broad Triton tile sweeps unless a new kernel family can plausibly beat cuBLAS on A100.
+The A100 win path:
+
+1. `a100_v0_safe.py` established that `torch.mm(a, b, out=c)` was already rank 2 at `634.197 us`.
+2. thin PyTorch/ATen API variants did not beat it.
+3. official environment probing confirmed `libcublasLt`, `nvcc`, `g++`, `ninja`, and `torch.utils.cpp_extension` were available.
+4. a fixed-shape cuBLASLt extension with row-major descriptors, `32MB` workspace allowance, and heuristic index `2` reached rank 1.
+
+Next work should focus on defending the A100 score and then deciding whether to repeat the same migration pattern on H100/B200: first get `torch.mm(out=c)` baseline, then use direct cuBLASLt only for the dominant final shape.
 
 ## Sources
 
