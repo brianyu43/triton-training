@@ -83,6 +83,25 @@ truthy in Python, so numeric mask flags keep local masked cases honest.
   `TRIMUL_V38_C384_LN_MODE=2` is two-warps-per-row, and
   `TRIMUL_V38_OLD_C384_LN=1` falls back to the v37 C384 LN. It passes official
   tests, but is not promoted because the C384 LN stage did not improve.
+- `submissions/v39_rank02_stage_timing.py`: analysis-only rank02 copy with
+  per-call CUDA event timing. It emits `trimul_rank02_stage_v39` rows so rank02
+  can be compared against v36/v37 in the same stage harness.
+- `submissions/v40_cuda_ext_rank02_hidden.py`: v37 plus the rank02-style hidden
+  LayerNorm/out-gate/layout kernel. It passes official tests and was the first
+  native path near rank02, with leaderboard-style rechecks at 2673.060 /
+  2643.726 us.
+- `submissions/v41_rank01_stage_timing.py`: analysis-only rank01 Triton timing
+  copy with mask inference fixed for this evaluator.
+- `submissions/v42_hybrid_rank01_c128.py`: v40 fallback plus rank01 Triton path
+  for `B=1, C=128, N in {512,768,1024}`. It passes official tests and is the
+  current best path, with leaderboard-style rechecks at 2503.175 / 2478.318 us.
+- `submissions/v43_hybrid_rank01_c128_cache.py`: v42 plus cached rank01 fp16
+  weights and work buffers. It passes official tests and benchmarks well in
+  long loops, but rechecks did not beat v42.
+- `submissions/v44_hybrid_rank01_c128_weight_cache.py`: v42 plus rank01 fp16
+  weight cache only. It is safer than v43, but still not promoted over v42.
+- `submissions/v45_hybrid_rank01_late_v40.py`: rank01-first dispatch-order
+  experiment. It passes correctness tests, but benchmark mode exits 112.
 - `third_party_public/rank01_ttt_a100.py`: public export for A100 rank 1,
   kept for reading and comparison.
 - `third_party_public/rank02_shiyegao_cuda_ext.py`: public export for A100 rank
@@ -108,6 +127,18 @@ Run stage timing on benchmark shapes:
 
 ```bash
 gpumode/trimul_a100/scripts/gcp_stage_timing.sh
+```
+
+Run the v39 rank02-vs-v37 stage comparison:
+
+```bash
+gpumode/trimul_a100/scripts/gcp_v39_stage_compare.sh
+```
+
+Run the v41 all-7 v40/rank02/rank01 stage comparison:
+
+```bash
+gpumode/trimul_a100/scripts/gcp_v41_stage_compare.sh
 ```
 
 Run the initial baseline suite:
