@@ -47,6 +47,13 @@
 | `v47_hybrid_rank01_c384n768.py` | v42 + full rank01 route for B1 N768 C384 | correctness pass, leaderboard recheck regressed |
 | `v48_c384_proj_gate_tail.py` | v42 + C384 Triton projection/gate feeding v40 tail | correctness pass; same-session win, not promoted |
 | `v49_v48_rank01_weight_cache.py` | v48 + rank01 fp16 transposed weight cache | correctness pass; cache effect small/noisy |
+| `v50_stable_c128.py` | v49 idea made safe: C128 rank01 work buffers plus CUDA weight pack, no default weight cache | correctness pass; diagnostic, not promoted |
+| `v51_c384_tail_fused.py` | v50 + C384 pack5 CUDA weight prep and reusable `lr5` bridge buffer | correctness pass; current best candidate |
+| `v52_submit_safe_current_stream.py` | v51 + explicit current CUDA stream hygiene | GPUMODE stream guard rejected |
+| `v53_submit_safe_no_stream_token.py` | public-rank02-style no-stream-token submit path | guard passed; compile failed on unavailable `CUDAGuard` header |
+| `v54_submit_safe_no_guard.py` | v53 without `CUDAGuard` | guard/compile passed; one masked C384 cauchy correctness failure |
+| `v55_submit_safe_no_weight_cache.py` | v54 with CUDA-extension packed-weight cache removed | accepted GPUMODE A100 leaderboard submission at 2267.563 us |
+| `v56`-`v61` submit diagnostics | masked C384 repack/sync/current-stream/fallback probes | not promoted; v55 remains accepted winner |
 
 ## A100 Baseline Results
 
@@ -89,6 +96,9 @@ official benchmark mode. Timings are mean microseconds.
 | `v47_hybrid_rank01_c384n768.py` | 2422.481 | official test pass; leaderboard-style recheck at 2545.999 us, so not promoted |
 | `v48_c384_proj_gate_tail.py` | 2505.572 | official and benchmark-shape tests pass; leaderboard-style recheck at 2522.822 us versus same-session v42 at 2571.735 us |
 | `v49_v48_rank01_weight_cache.py` | 2432.794 | official and benchmark-shape tests pass; leaderboard-style rechecks at 2489.406 / 2521.721 us; cache-disabled control was 2492.101 us |
+| `v50_stable_c128.py` | 2422.352 | official test pass; safe leaderboard-style recheck at 2500.694 us; an unsafe default weight-cache variant failed leaderboard correctness |
+| `v51_c384_tail_fused.py` | 2342.090 | official test pass; leaderboard-style rechecks at 2490.251 / 2467.681 us; same-session v42 control was 2532.269 us |
+| `v55_submit_safe_no_weight_cache.py` | 2267.563 | GPUMODE A100 accepted submission `#781360`; test, benchmark, and leaderboard all passed |
 | `rank02_shiyegao_cuda_ext.py` | 2610.515 | public CUDA extension reference point |
 
 `rank02_shiyegao_cuda_ext.py` also passed official leaderboard recheck mode at
@@ -596,6 +606,96 @@ of geomean in recheck. This is not a stable promotion over v42's best historical
 answer. The next move should attack a broader source of variance/work than
 weight conversion alone.
 
+## v50 Stable C128
+
+`v50_stable_c128.py` starts from v49 but makes the C128 rank01 path safe for
+leaderboard-style recheck:
+
+- rank01 C128 reuses activation/work buffers for `x_norm`, left/right,
+  `out_gate`, hidden `bmm(out=...)`, and the empty mask tensor
+- six Python-side `t().contiguous().to(fp16)` calls are replaced with one CUDA
+  pack/transpose kernel for fresh rank01 weights
+- rank01 weight caching is disabled by default; it is now diagnostic-only behind
+  `TRIMUL_V50_ENABLE_RANK01_WEIGHT_CACHE=1`
+
+Validation on A100:
+
+- full official test: 18/18 pass
+- benchmark geomean: 2422.352 us
+- safe leaderboard-style recheck: 2500.694 us
+- unsafe weight-cache attempt failed leaderboard correctness on `B1 N768 C128`
+  because recheck can reuse data pointers for new random weights
+
+Conclusion: v50 confirms the important lesson from v49 more sharply. Pointer /
+version-based CUDA weight caches are not safe under leaderboard recheck unless
+the evaluator truly reuses the same weight tensors. Fresh one-kernel packing is
+correct but not enough to beat v42's best historical recheck by itself.
+
+## v51 C384 Tail-Fused Candidate
+
+`v51_c384_tail_fused.py` keeps v50's safe C128 behavior and attacks the v48 C384
+bridge overhead:
+
+- large C384 projection/gate weight prep now uses one CUDA pack5/transpose
+  kernel instead of five Python transpose/cast calls
+- the huge H-major `lr5` bridge buffer is reused per shape instead of allocated
+  every call
+- C384 weight caching is opt-in only via `TRIMUL_V51_ENABLE_C384_WEIGHT_CACHE=1`
+  for the same stale-pointer reason found in v50
+
+Validation on A100:
+
+- full official test: 18/18 pass
+- benchmark geomean: 2342.090 us
+- leaderboard-style rechecks: 2490.251 us and 2467.681 us
+- same-session v42 leaderboard control: 2532.269 us
+
+Second v51 recheck shape means:
+
+| Shape | v51 mean us |
+| --- | ---: |
+| B2 N256 C128 nomask normal | 798.720 |
+| B1 N768 C128 nomask cauchy | 2849.690 |
+| B2 N256 C384 mask normal | 1126.328 |
+| B1 N512 C128 nomask normal | 1121.833 |
+| B1 N1024 C128 nomask cauchy | 5096.537 |
+| B1 N768 C384 mask normal | 4633.941 |
+| B1 N1024 C384 nomask normal | 8203.737 |
+
+Conclusion: v51 is the current best candidate because it beats v42 in the same
+session and one recheck beats v42's best historical 2478.318 us. This is still
+not a rank-1-sized jump. The next target should be `v52`: masked/small C384
+balance and removal of the remaining C384 bridge traffic without reintroducing
+unsafe weight caches.
+
+## v55 GPUMODE Accepted Submission
+
+`v55_submit_safe_no_weight_cache.py` is the accepted public GPUMODE A100
+submission. It started from the v51/v54 submit-safe line and made one important
+correctness trade-off: CUDA-extension packed-weight caches are removed, so fresh
+weights are packed every call. Work buffers are still reused. This avoids stale
+pointer/version cache hazards under evaluator correctness/recheck while keeping
+the fast hybrid C128/C384 paths.
+
+Submission result:
+
+- GPUMODE submission id: 781360
+- test on A100: passed
+- benchmark on A100: passed
+- leaderboard on A100: passed
+- public leaderboard score observed: 2267.563 us
+
+The later `v56` through `v61` files are diagnostics from trying to explain
+subsequent failed submissions after v55 had already landed. They do not
+supersede v55. The main lessons are:
+
+- the public evaluator rejects explicit current-stream API usage in this file
+  family, even though it is the normal CUDA hygiene fix locally
+- the no-stream-token/default-launch style matches public rank02 enough to pass
+  the guard
+- pointer/version weight caches are too risky for correctness, so v55 keeps
+  weight packing fresh by default
+
 ## v21 Shape Results
 
 | Shape | v20 mean us | v21 best run mean us | Change | Notes |
@@ -865,3 +965,18 @@ workspace, or move to a custom/fused projection path for the C384-heavy shapes.
     broader source. Prefer a recheck-stable C128 path or a C384 path that
     combines projection/gate with the tail without reintroducing rank01's C384
     final regression.
+    Done as a safety/stability pass; C128 work-buffer reuse and CUDA
+    pack/transpose are correct, but default weight caching is disabled because
+    pointer/version keys can go stale under recheck. Safe recheck was 2500.694
+    us, so this is not promoted.
+31. `v51`: reduce C384 tail/bridge overhead while preserving v40's good C384
+    tail. Done; C384 pack5 CUDA weight prep plus reusable `lr5` bridge buffer
+    passes correctness and rechecks at 2490.251 / 2467.681 us. Keep as the
+    current candidate, but require more rechecks before final promotion.
+32. `v52`: masked/small C384 balance. Focus on `B2 N256 C384 masked` and
+    `B1 N768 C384 masked` without unsafe mask removal or pointer-based weight
+    caches. The target is 20-80 us per masked C384 row plus less run-count
+    volatility.
+    Superseded by the submit-safe v55 path, which landed on GPUMODE at
+    2267.563 us. Keep v55 as the canonical submitted file; v56-v61 are
+    diagnostic branches only.

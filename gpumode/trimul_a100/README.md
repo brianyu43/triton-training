@@ -117,6 +117,22 @@ truthy in Python, so numeric mask flags keep local masked cases honest.
   transposed weight caching for the rank01 C128 branch. It passes correctness
   and has one strong recheck, but the cache effect is small and not stable
   enough to promote.
+- `submissions/v50_stable_c128.py`: v49 made leaderboard-safe for C128. It
+  reuses rank01 work buffers and uses one CUDA pack/transpose kernel for fresh
+  C128 weights, with pointer-based weight caching disabled by default after an
+  unsafe cache variant failed leaderboard correctness.
+- `submissions/v51_c384_tail_fused.py`: v50 plus C384 pack5 CUDA weight prep
+  and reusable H-major `lr5` bridge buffer for the v48 C384 path. It passes
+  official tests and is the current candidate, with leaderboard-style rechecks
+  at 2490.251 / 2467.681 us.
+- `submissions/v55_submit_safe_no_weight_cache.py`: GPUMODE submit-safe
+  variant. It removes the CUDA-extension packed-weight cache and avoids stream
+  API tokens that trigger the public evaluator guard. This is the accepted
+  leaderboard submission, passing test/benchmark/leaderboard on A100 at
+  2267.563 us.
+- `submissions/v56_*` through `submissions/v61_*`: submit diagnostics after
+  v55. These explored masked C384 repacking, explicit current-stream launches,
+  syncs, and PyTorch fallback routes; none supersede v55.
 - `third_party_public/rank01_ttt_a100.py`: public export for A100 rank 1,
   kept for reading and comparison.
 - `third_party_public/rank02_shiyegao_cuda_ext.py`: public export for A100 rank
