@@ -25,6 +25,20 @@ def parse_int(fields: dict[str, str], key: str, default: int = 0) -> int:
 
 def variant_from_path(path: Path) -> str:
     name = path.name
+    if "v49" in name:
+        return "v49"
+    if "v48" in name:
+        return "v48"
+    if "v46" in name:
+        return "v46_hybrid"
+    if "v45" in name:
+        return "v45"
+    if "v44" in name:
+        return "v44"
+    if "v43" in name:
+        return "v43"
+    if "v42" in name:
+        return "v42"
     if "rank01" in name or "v41_rank01" in name:
         return "rank01_v41"
     if "v40" in name:
@@ -44,14 +58,45 @@ def rows_from_log(path: Path) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     variant = variant_from_path(path)
     for line in path.read_text(errors="replace").splitlines():
-        if line.startswith("trimul_rank01_stage_v41 "):
+        if line.startswith("trimul_stage_v48 "):
+            fields = dict(FIELD_RE.findall(line))
+            prep = parse_float(fields, "prep_ms")
+            proj_gate = parse_float(fields, "proj_gate_ms")
+            tail = parse_float(fields, "tail_ms")
+            variant_name = variant
+            path_name = fields.get("path")
+            if path_name:
+                variant_name = f"{variant}:{path_name}"
+            rows.append(
+                {
+                    "variant": variant_name,
+                    "shape": shape_label(fields),
+                    "B": parse_int(fields, "B"),
+                    "N": parse_int(fields, "N"),
+                    "C": parse_int(fields, "C"),
+                    "H": parse_int(fields, "H"),
+                    "ln": parse_float(fields, "ln_ms"),
+                    "proj_gate": prep + proj_gate,
+                    "central": 0.0,
+                    "hidden": 0.0,
+                    "out": tail,
+                    "hidden_out": tail,
+                    "total": parse_float(fields, "total_ms"),
+                    "source": str(path),
+                }
+            )
+        elif line.startswith("trimul_hybrid_stage_v46 ") or line.startswith("trimul_rank01_stage_v41 "):
             fields = dict(FIELD_RE.findall(line))
             prep = parse_float(fields, "prep_ms")
             proj_gate = parse_float(fields, "proj_gate_ms")
             hidden_out = parse_float(fields, "hidden_out_ms")
+            variant_name = variant
+            path_name = fields.get("path")
+            if path_name:
+                variant_name = f"{variant}:{path_name}"
             rows.append(
                 {
-                    "variant": variant,
+                    "variant": variant_name,
                     "shape": shape_label(fields),
                     "B": parse_int(fields, "B"),
                     "N": parse_int(fields, "N"),

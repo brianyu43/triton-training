@@ -102,6 +102,21 @@ truthy in Python, so numeric mask flags keep local masked cases honest.
   weight cache only. It is safer than v43, but still not promoted over v42.
 - `submissions/v45_hybrid_rank01_late_v40.py`: rank01-first dispatch-order
   experiment. It passes correctness tests, but benchmark mode exits 112.
+- `submissions/v46_hybrid_stage_timing.py`: analysis-only v42 hybrid timing
+  build. It compares the active hybrid against rank01, rank02, and v40 in one
+  all-7 stage harness.
+- `submissions/v47_hybrid_rank01_c384n768.py`: v42 plus a probe that also
+  routes `B=1, N=768, C=384` through the full rank01 path. It passes official
+  tests, but leaderboard-style recheck regresses, so it is not promoted.
+- `submissions/v48_c384_proj_gate_tail.py`: v42 plus a surgical C384 path that
+  keeps v40 input LN/central/hidden/final while replacing large C384
+  projection/gate with a Triton H-major writer. It passes official and
+  benchmark-shape tests, and beats v42 in same-session recheck, but does not
+  beat v42's best historical recheck.
+- `submissions/v49_v48_rank01_weight_cache.py`: v48 plus v44-style fp16
+  transposed weight caching for the rank01 C128 branch. It passes correctness
+  and has one strong recheck, but the cache effect is small and not stable
+  enough to promote.
 - `third_party_public/rank01_ttt_a100.py`: public export for A100 rank 1,
   kept for reading and comparison.
 - `third_party_public/rank02_shiyegao_cuda_ext.py`: public export for A100 rank
@@ -139,6 +154,12 @@ Run the v41 all-7 v40/rank02/rank01 stage comparison:
 
 ```bash
 gpumode/trimul_a100/scripts/gcp_v41_stage_compare.sh
+```
+
+Run the v46 all-7 hybrid/rank01/rank02/v40 stage comparison:
+
+```bash
+gpumode/trimul_a100/scripts/gcp_v46_stage_compare.sh
 ```
 
 Run the initial baseline suite:

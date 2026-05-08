@@ -43,6 +43,10 @@
 | `v43_hybrid_rank01_c128_cache.py` | v42 + rank01 weight/work-buffer cache | benchmark-only win; not promoted |
 | `v44_hybrid_rank01_c128_weight_cache.py` | v42 + rank01 fp16 weight cache only | small/noisy recheck result; not promoted over v42 |
 | `v45_hybrid_rank01_late_v40.py` | route early benchmark shapes to rank01, load v40 late | correctness pass, benchmark mode exits 112 |
+| `v46_hybrid_stage_timing.py` | v42 + same-session all-7 stage timing | analysis-only; guides next target |
+| `v47_hybrid_rank01_c384n768.py` | v42 + full rank01 route for B1 N768 C384 | correctness pass, leaderboard recheck regressed |
+| `v48_c384_proj_gate_tail.py` | v42 + C384 Triton projection/gate feeding v40 tail | correctness pass; same-session win, not promoted |
+| `v49_v48_rank01_weight_cache.py` | v48 + rank01 fp16 transposed weight cache | correctness pass; cache effect small/noisy |
 
 ## A100 Baseline Results
 
@@ -81,6 +85,10 @@ official benchmark mode. Timings are mean microseconds.
 | `v43_hybrid_rank01_c128_cache.py` | 2413.589 | official test pass; leaderboard-style rechecks at 2510.026 / 2509.072 us, so not promoted |
 | `v44_hybrid_rank01_c128_weight_cache.py` | 2413.037 | official test pass; leaderboard-style rechecks at 2494.435 / 2495.585 us, so v42 remains best verified |
 | `v45_hybrid_rank01_late_v40.py` | n/a | official test pass and benchmark-case test pass; benchmark mode exits 112 before rows |
+| `v46_hybrid_stage_timing.py` | n/a | official test pass; analysis-only all-7 timing harness for v42/v40/rank01/rank02 |
+| `v47_hybrid_rank01_c384n768.py` | 2422.481 | official test pass; leaderboard-style recheck at 2545.999 us, so not promoted |
+| `v48_c384_proj_gate_tail.py` | 2505.572 | official and benchmark-shape tests pass; leaderboard-style recheck at 2522.822 us versus same-session v42 at 2571.735 us |
+| `v49_v48_rank01_weight_cache.py` | 2432.794 | official and benchmark-shape tests pass; leaderboard-style rechecks at 2489.406 / 2521.721 us; cache-disabled control was 2492.101 us |
 | `rank02_shiyegao_cuda_ext.py` | 2610.515 | public CUDA extension reference point |
 
 `rank02_shiyegao_cuda_ext.py` also passed official leaderboard recheck mode at
@@ -486,6 +494,108 @@ useful move should avoid relying on cache warmup amortization. Either build a
 real C128 projection/gate/final fused path that is fast from the first timed
 iteration, or attack the C384 rows where v42 still spends most of the geomean.
 
+## v46-v47 Remaining Gap Check
+
+`v46_hybrid_stage_timing.py` keeps v42's dispatch and adds timing around the
+rank01 branch, then compares it with rank01, rank02, and v40 in the same all-7
+stage harness. This was mainly a sanity check before chasing rank #1.
+
+Key warmed rows from 2026-05-08:
+
+| Variant | Shape | LN | Proj+Gate | Central | Hidden+Out | Total |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| v40 | B1 N768 C384 | 0.9984 | 2.2476 | 0.5222 | 0.9707 | 4.7391 |
+| rank01_v41 | B1 N768 C384 | 1.0895 | 2.0972 | 0.5202 | 1.0035 | 4.7104 |
+| v46_hybrid | B1 N768 C384 | 0.9974 | 2.2456 | 0.5212 | 0.9708 | 4.7350 |
+| v40 | B1 N1024 C384 | 1.7633 | 3.9168 | 1.0772 | 1.6036 | 8.3610 |
+| rank01_v41 | B1 N1024 C384 | 1.9302 | 3.7867 | 1.0762 | 1.7623 | 8.5555 |
+| v46_hybrid | B1 N1024 C384 | 1.7664 | 3.9169 | 1.0762 | 1.5964 | 8.3558 |
+| v40 | B1 N1024 C128 | 0.5990 | 2.9225 | 1.3507 | 1.2421 | 6.1143 |
+| rank01_v41 | B1 N1024 C128 | 0.5929 | 2.0296 | 1.3496 | 0.9595 | 4.9316 |
+| v46_hybrid:rank01_c128 | B1 N1024 C128 | 0.5960 | 2.0367 | 1.3517 | 0.9636 | 4.9480 |
+
+Conclusion: the suggested "final fusion first" plan is not supported for C384.
+Rank01's fused final bucket is better on the C128 rows already routed through
+rank01, but it is worse on the C384 large rows. The reusable signal is narrower:
+rank01's projection/gate bucket is 130-150 us better on large C384, while v40's
+input LN, hidden, and final cuBLAS path are better.
+
+`v47_hybrid_rank01_c384n768.py` tested the cheap dispatch version of that idea
+by routing `B1 N768 C384` through full rank01. It passed correctness and
+benchmark mode looked fast at 2422.481 us geomean, but leaderboard-style recheck
+regressed to 2545.999 us. Shape rows showed the full C384 swap was not stable,
+so v47 is kept as evidence, not a promoted path.
+
+## v48 C384 Projection/Gate Tail Split
+
+`v48_c384_proj_gate_tail.py` is the surgical version of the v47 idea:
+
+- keep v42's rank01 route for `B1 C128 N512/768/1024`
+- keep v40 for small shapes and non-target C384 cases
+- for `B1 C384 N768` and nomask `B1 C384 N1024`, run v40's warp input LN,
+  then a Triton projection/gate kernel that writes v40-compatible H-major
+  `left`, `right`, and raw `out_gate` logits, then v40's central/hidden/final
+  tail
+- masked `B1 N1024 C384` falls back to v40 because official tests include that
+  non-benchmark case
+
+The main correctness trap was out-gate representation. Rank01 stores
+`sigmoid(out_gate)` because its final kernel expects a post-sigmoid gate; v40's
+hidden kernel expects raw logits and applies sigmoid itself. v48 stores raw
+out-gate logits.
+
+Validation on A100:
+
+- full official test: 18/18 pass
+- benchmark-shape test: 7/7 pass
+- benchmark geomean: 2505.572 us
+- leaderboard-style recheck: 2522.822 us
+- same-session v42 leaderboard-style control: 2571.735 us
+
+Warmed stage timing showed the intended local win but also why this is not a
+rank-1-sized jump:
+
+| Shape | v40/v46 proj+gate | v48 proj+gate | v48 total read |
+| --- | ---: | ---: | --- |
+| B1 N768 C384 masked | ~2.245 ms | ~2.06-2.07 ms | small total win, roughly 4.72 ms in timing |
+| B1 N1024 C384 nomask | ~3.917 ms | ~3.69-3.72 ms | mostly flat total, tail overhead eats much of it |
+
+Tile sweep notes:
+
+- default `BLOCK_M=64, BLOCK_H=64, BLOCK_K=32, warps=4` remains best overall
+- `BLOCK_H=32` and `BLOCK_K=64` were slower on N768 and did not produce a
+  stable N1024 enough win
+
+Conclusion: v48 is a useful C384 improvement in same-session comparison, but it
+does not beat v42's best historical recheck. Do not promote it as the final
+submission yet. The next 200-300 us probably has to come from first-timed C128
+stability or a deeper C384 path that also removes tail/packing overhead, not
+only projection/gate.
+
+## v49 Rank01 Weight Cache On v48
+
+`v49_v48_rank01_weight_cache.py` adds the safer v44 idea on top of v48: cache
+only the fp16 transposed rank01 weights for the C128 Triton branch. It does not
+cache activations or work buffers. The cache can be disabled with
+`TRIMUL_V49_DISABLE_RANK01_WEIGHT_CACHE=1`, while the v48 C384 path still keeps
+`TRIMUL_V48_DISABLE_C384=1`.
+
+Validation on A100:
+
+- full official test: 18/18 pass
+- benchmark-shape test: 7/7 pass
+- benchmark geomean: 2432.794 us
+- leaderboard-style rechecks: 2489.406 us and 2521.721 us
+- cache-disabled leaderboard control: 2492.101 us
+- same-session v42 leaderboard control: 2549.262 us
+
+Conclusion: v49 is better than v42 in the same session and produced one strong
+recheck, but the rank01 weight cache itself only accounts for a few microseconds
+of geomean in recheck. This is not a stable promotion over v42's best historical
+2478.318 us. Keep v49 as the current best experimental candidate, not the final
+answer. The next move should attack a broader source of variance/work than
+weight conversion alone.
+
 ## v21 Shape Results
 
 | Shape | v20 mean us | v21 best run mean us | Change | Notes |
@@ -734,6 +844,24 @@ workspace, or move to a custom/fused projection path for the C384-heavy shapes.
     safer but still not better than v42's best recheck.
 25. `v45`: test rank01-first dispatch order. Done; correctness passes, but
     benchmark mode exits 112 before producing rows.
-26. `v46`: target the remaining gap without relying on cache amortization.
-    Start with C384-specific projection/gate or fused final work, and keep v42
-    as the verified baseline.
+26. `v46`: measure v42/v40/rank01/rank02 in one all-7 stage harness before
+    changing more code. Done; final fusion is not the right C384-first target.
+27. `v47`: cheap C384 dispatch probe. Done; full rank01 for `B1 N768 C384`
+    passes correctness but regresses leaderboard-style recheck, so do not
+    promote.
+28. `v48`: surgical C384 projection/gate work. Do not route full C384 rows
+    through rank01, and do not replace the v40 C384 final path yet. The target
+    is a native C384 projection/gate kernel or split-stage path that writes
+    v40-compatible H-major left/right/out-gate buffers, preserving v40's input
+    LN, central GEMM, hidden kernel, and final cuBLAS projection.
+    Done; correctness passes and same-session recheck beats v42, but it does
+    not beat v42's best historical run.
+29. `v49`: reintroduce the safer v44 rank01 fp16 transposed weight cache on
+    top of v48. Done; correctness passes and one recheck hit 2489.406 us, but
+    cache-disabled control was 2492.101 us, so the cache is not a large enough
+    lever by itself.
+30. `v50`: stabilize first-timed C128 or remove v48 tail overhead. The C384
+    projection/gate win is only 100-200 us per C384 large row; rank #1 needs a
+    broader source. Prefer a recheck-stable C128 path or a C384 path that
+    combines projection/gate with the tail without reintroducing rank01's C384
+    final regression.
