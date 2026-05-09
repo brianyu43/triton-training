@@ -93,10 +93,10 @@ Checker는 `verbose_allclose` 기반이며 기본값은 `rtol=1e-5`, `atol=1e-8`
 
 초기 제출은 빠르지 않아도 된다. 목적은 strategy correctness다.
 
-- `N < 100000`: exact fallback.
-- `N >= 100000`: quantized key order prototype.
-- base 추정은 `data[:cols].mean().round()`.
-- overflow는 clamp하지 말고 별도 counter를 둬 실패를 볼 수 있게 한다.
+- [x] `N < 100000`: exact fallback.
+- [x] `N >= 100000`: quantized bucket counting prototype.
+- [x] base 추정은 first row mean rounded in CUDA.
+- [x] `v02_bucket_counting_cuda.py`에서 global histogram + CUB scan + atomic scatter end-to-end pass.
 
 ### Phase 3: A100 CUDA Extension
 
@@ -159,6 +159,10 @@ gpumode/sort_v2/scripts/gcp_stop_a100.sh
 | `v00_torch_sort.py` | leaderboard | 2663.920 | pass | recheck mode, close to current rank1 |
 | `v01_bucket_argsort_probe.py` | test | N/A | pass | exact fallback on public tests |
 | `v01_bucket_argsort_probe.py` | benchmark | 3404.839 | pass | int-key argsort is slower; counting sort is still required |
+| `v02_bucket_counting_cuda.py` | smoke | N/A | pass | exact small + 100k CUDA path |
+| `v02_bucket_counting_cuda.py` | test | N/A | pass | public tests 5/5 |
+| `v02_bucket_counting_cuda.py` | benchmark | 1576.142 | pass | global histogram + CUB scan + atomic scatter |
+| `v02_bucket_counting_cuda.py` | leaderboard | 1800.999 | pass | recheck mode; current rank1 candidate |
 
 Per-shape means from the first GCP run:
 
@@ -167,6 +171,8 @@ Per-shape means from the first GCP run:
 | `v00_torch_sort.py` | benchmark | 104.192 | 155.611 | 220.979 | 1179.307 | 10791.936 |
 | `v00_torch_sort.py` | leaderboard | 105.431 | 157.930 | 222.397 | 1269.467 | 11564.373 |
 | `v01_bucket_argsort_probe.py` | benchmark | 156.150 | 210.968 | 224.950 | 1605.291 | 14826.837 |
+| `v02_bucket_counting_cuda.py` | benchmark | 38.840 | 80.292 | 135.862 | 787.100 | 6838.613 |
+| `v02_bucket_counting_cuda.py` | leaderboard | 40.530 | 81.265 | 137.181 | 919.589 | 7826.432 |
 
 Bucket probe:
 
@@ -181,3 +187,16 @@ Bucket probe:
 | 100000000 | 6252 | 64 | 16 | True | 0.01513672 | 0.01367188 | sampled p99 |
 
 Interpretation: bucket ordering is correct enough even at `BPU=64`; the losing `v01` result shows that sorting quantized keys with a general sort is the wrong engine. The next real move is a CUDA histogram/counting sort that avoids full argsort.
+
+## Current Candidate
+
+`submissions/v02_bucket_counting_cuda.py` is the current A100 submission candidate. It is intentionally simple:
+
+- public tests use exact `torch.sort`
+- benchmark sizes use `BPU=64`, `BIAS=16`
+- first row base is estimated in one CUDA block
+- counts use global atomics
+- CUB `DeviceScan::ExclusiveSum` builds bucket starts
+- scatter uses atomic increments into bucket ranges
+
+Despite the global atomics, the first GCP A100 leaderboard-style recheck passed at `1800.999 us`, well below the 2026-05-09 public rank1 snapshot of `2606.421 us`. The next optimization should only proceed after preserving this file as the stable candidate.
