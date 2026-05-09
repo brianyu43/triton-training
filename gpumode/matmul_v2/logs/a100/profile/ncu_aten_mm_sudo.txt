@@ -1,0 +1,94 @@
+==PROF== Connected to process 2588 (/usr/bin/python3.10)
+==PROF== Profiling "ampere_fp16_s16816gemm_fp16_256x128_ldg8_f2f_stages_64x3_nn": 0%....50%....100% - 13 passes
+==PROF== Disconnected from process 2588
+[2588] python3.10@127.0.0.1
+  ampere_fp16_s16816gemm_fp16_256x128_ldg8_f2f_stages_64x3_nn (20, 32, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 8.0
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- ------------
+    Metric Name             Metric Unit Metric Value
+    ----------------------- ----------- ------------
+    DRAM Frequency                  Ghz         1.21
+    SM Frequency                    Ghz         1.09
+    Elapsed Cycles                cycle       858063
+    Memory Throughput                 %        48.57
+    DRAM Throughput                   %        27.04
+    Duration                         us       777.95
+    L1/TEX Cache Throughput           %        49.59
+    L2 Cache Throughput               %        48.21
+    SM Active Cycles              cycle    834680.80
+    Compute (SM) Throughput           %        91.13
+    ----------------------- ----------- ------------
+
+    INF   This workload is utilizing greater than 80.0% of the available compute or memory performance of the device.   
+          To further improve performance, work will likely need to be shifted from the most utilized to another unit.   
+          Start by analyzing workloads in the Compute Workload Analysis section.                                        
+
+    Section: Memory Workload Analysis
+    ---------------------------- ----------- ------------
+    Metric Name                  Metric Unit Metric Value
+    ---------------------------- ----------- ------------
+    Memory Throughput                Gbyte/s       420.55
+    Mem Busy                               %        48.57
+    Max Bandwidth                          %        48.21
+    L1/TEX Hit Rate                        %            0
+    L2 Compression Success Rate            %            0
+    L2 Compression Ratio                                0
+    L2 Compression Input Sectors      sector            0
+    L2 Hit Rate                            %        78.64
+    Mem Pipes Busy                         %        23.25
+    ---------------------------- ----------- ------------
+
+    Section: Scheduler Statistics
+    ---------------------------- ----------- ------------
+    Metric Name                  Metric Unit Metric Value
+    ---------------------------- ----------- ------------
+    One or More Eligible                   %        19.91
+    Issued Warp Per Scheduler                        0.20
+    No Eligible                            %        80.09
+    Active Warps Per Scheduler          warp         2.00
+    Eligible Warps Per Scheduler        warp         0.32
+    ---------------------------- ----------- ------------
+
+    OPT   Est. Local Speedup: 8.873%                                                                                    
+          Every scheduler is capable of issuing one instruction per cycle, but for this workload each scheduler only    
+          issues an instruction every 5.0 cycles. This might leave hardware resources underutilized and may lead to     
+          less optimal performance. Out of the maximum of 16 warps per scheduler, this workload allocates an average    
+          of 2.00 active warps per scheduler, but only an average of 0.32 warps were eligible per cycle. Eligible       
+          warps are the subset of active warps that are ready to issue their next instruction. Every cycle with no      
+          eligible warp results in no instruction being issued and the issue slot remains unused. To increase the       
+          number of eligible warps, avoid possible load imbalances due to highly different execution durations per      
+          warp. Reducing stalls indicated on the Warp State Statistics and Source Counters sections can help, too.      
+
+    Section: Warp State Statistics
+    ---------------------------------------- ----------- ------------
+    Metric Name                              Metric Unit Metric Value
+    ---------------------------------------- ----------- ------------
+    Warp Cycles Per Issued Instruction             cycle        10.05
+    Warp Cycles Per Executed Instruction           cycle        10.05
+    Avg. Active Threads Per Warp                                   32
+    Avg. Not Predicated Off Threads Per Warp                    31.41
+    ---------------------------------------- ----------- ------------
+
+    WRN   The optional metric smsp__pcsamp_sample_count could not be found. Collecting it as an additional metric could 
+          enable the rule to provide more guidance.                                                                     
+    ----- --------------------------------------------------------------------------------------------------------------
+    OPT   Est. Speedup: 8.873%                                                                                          
+          On average, each warp of this workload spends 4.1 cycles being stalled waiting for the execution pipe to be   
+          available. This stall occurs when all active warps execute their next instruction on a specific,              
+          oversubscribed math pipeline. Try to increase the number of active warps to hide the existent latency or try  
+          changing the instruction mix to utilize all available pipelines in a more balanced way. This stall type       
+          represents about 41.3% of the total average of 10.0 cycles between issuing two instructions.                  
+    ----- --------------------------------------------------------------------------------------------------------------
+    OPT   Est. Speedup: 8.873%                                                                                          
+          On average, each warp of this workload spends 4.0 cycles being stalled waiting on a fixed latency execution   
+          dependency. Typically, this stall reason should be very low and only shows up as a top contributor in         
+          already highly optimized kernels. Try to hide the corresponding instruction latencies by increasing the       
+          number of active warps, restructuring the code or unrolling loops. Furthermore, consider switching to         
+          lower-latency instructions, e.g. by making use of fast math compiler options. This stall type represents      
+          about 39.6% of the total average of 10.0 cycles between issuing two instructions.                             
+    ----- --------------------------------------------------------------------------------------------------------------
+    INF   Check the Warp Stall Sampling (All Samples) table for the top stall locations in your source based on         
+          sampling data. The Profiling Guide                                                                            
+          (https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#metrics-reference) provides more details    
+          on each stall reason.                                                                                         
+
