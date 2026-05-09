@@ -163,6 +163,9 @@ gpumode/sort_v2/scripts/gcp_stop_a100.sh
 | `v02_bucket_counting_cuda.py` | test | N/A | pass | public tests 5/5 |
 | `v02_bucket_counting_cuda.py` | benchmark | 1576.142 | pass | global histogram + CUB scan + atomic scatter |
 | `v02_bucket_counting_cuda.py` | leaderboard | 1800.999 | pass | recheck mode; current rank1 candidate |
+| `v02_bucket_counting_cuda.py` | official test | N/A | pass | Modal A100, submission `781696` |
+| `v02_bucket_counting_cuda.py` | official benchmark | 6387.143 | pass | Modal A100 reports 100M case only |
+| `v02_bucket_counting_cuda.py` | official leaderboard | 6387.143 | pass public / secret timeout | API rank 7 as of 2026-05-09 |
 
 Per-shape means from the first GCP run:
 
@@ -200,3 +203,5 @@ Interpretation: bucket ordering is correct enough even at `BPU=64`; the losing `
 - scatter uses atomic increments into bucket ranges
 
 Despite the global atomics, the first GCP A100 leaderboard-style recheck passed at `1800.999 us`, well below the 2026-05-09 public rank1 snapshot of `2606.421 us`. The next optimization should only proceed after preserving this file as the stable candidate.
+
+Official submission note: `v02_bucket_counting_cuda.py` was submitted as `781696` on 2026-05-09. The server accepted public test, benchmark, and leaderboard runs, but the leaderboard API score is `6387.143 us` because the official Modal output/ranking is dominated by the `size=100000000` case. The secret benchmark leg timed out, so future work should treat `100M` wall time and compile/runtime overhead as the real scoring target.

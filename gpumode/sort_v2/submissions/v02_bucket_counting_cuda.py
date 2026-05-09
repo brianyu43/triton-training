@@ -42,7 +42,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     cuda_src = r"""
 #include <torch/extension.h>
 
-#include <ATen/cuda/CUDAContext.h>
 #include <cub/cub.cuh>
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -58,6 +57,10 @@ constexpr int kThreads = 256;
 
 static inline int64_t ceil_div_i64(int64_t a, int64_t b) {
   return (a + b - 1) / b;
+}
+
+static inline void cuda_check(cudaError_t status, const char* msg) {
+  TORCH_CHECK(status == cudaSuccess, msg, ": ", cudaGetErrorString(status));
 }
 
 __device__ __forceinline__ int bucket_id(float x, float base, int bucket_count) {
@@ -144,23 +147,22 @@ torch::Tensor sort_v2_bucket_counting_cuda(torch::Tensor values, torch::Tensor o
   auto offsets = torch::empty({bucket_count}, int_opts);
   auto base = torch::empty({1}, values.options());
 
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  C10_CUDA_CHECK(cudaMemsetAsync(counts.data_ptr<int>(), 0, bucket_count * sizeof(int), stream));
+  cuda_check(cudaMemsetAsync(counts.data_ptr<int>(), 0, bucket_count * sizeof(int)), "cudaMemsetAsync failed");
 
-  estimate_base_kernel<<<1, kThreads, 0, stream>>>(
+  estimate_base_kernel<<<1, kThreads>>>(
       values.data_ptr<float>(),
       base.data_ptr<float>(),
       cols);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  cuda_check(cudaGetLastError(), "estimate_base_kernel launch failed");
 
   const int blocks = static_cast<int>(std::min<int64_t>(ceil_div_i64(n, kThreads), 4096));
-  histogram_kernel<<<blocks, kThreads, 0, stream>>>(
+  histogram_kernel<<<blocks, kThreads>>>(
       values.data_ptr<float>(),
       base.data_ptr<float>(),
       counts.data_ptr<int>(),
       n,
       bucket_count);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  cuda_check(cudaGetLastError(), "histogram_kernel launch failed");
 
   void* temp_storage = nullptr;
   size_t temp_bytes = 0;
@@ -169,25 +171,23 @@ torch::Tensor sort_v2_bucket_counting_cuda(torch::Tensor values, torch::Tensor o
       temp_bytes,
       counts.data_ptr<int>(),
       offsets.data_ptr<int>(),
-      bucket_count,
-      stream);
+      bucket_count);
   auto temp = torch::empty({static_cast<int64_t>(temp_bytes)}, byte_opts);
   cub::DeviceScan::ExclusiveSum(
       temp.data_ptr<uint8_t>(),
       temp_bytes,
       counts.data_ptr<int>(),
       offsets.data_ptr<int>(),
-      bucket_count,
-      stream);
+      bucket_count);
 
-  scatter_kernel<<<blocks, kThreads, 0, stream>>>(
+  scatter_kernel<<<blocks, kThreads>>>(
       values.data_ptr<float>(),
       base.data_ptr<float>(),
       offsets.data_ptr<int>(),
       output.data_ptr<float>(),
       n,
       bucket_count);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  cuda_check(cudaGetLastError(), "scatter_kernel launch failed");
 
   return output;
 }
