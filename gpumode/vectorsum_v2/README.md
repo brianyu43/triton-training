@@ -338,3 +338,56 @@ Next creative hypotheses:
 1. Look for an estimator that uses structure beyond mean sampling, such as fast estimation of offset/scale plus residual correction. It must beat simple sample mean by a lot; otherwise the tolerance is too tight.
 2. Investigate whether official rank1 is using a lower-level full-read implementation that genuinely reaches about 1.55 TB/s, or whether there is an environment/measurement difference.
 3. If staying exact, inspect generated SASS for load count and register spills, but treat this as marginal work. The current evidence says exact CUDA in this harness is stuck around 165-166 us on this VM.
+
+## V14 Bandwidth/SASS Probe
+
+2026-05-10 live API recheck:
+
+- A100 rank1 is still `135.339 us`: Kernel-Zhang, `cuda_000013.py`, submitted 2026-04-23.
+- Selected benchmark remains `size=52,428,800`, `seed=12345`.
+
+Calibration on the same GCP A100, SM clock locked to 1410 MHz:
+
+| Candidate | Mode | Mean us | Best us | Correct |
+| --- | --- | ---: | ---: | --- |
+| `v12c_cuda_atomic_int32_launchbounds.py` | selected benchmark | 166.175 | 164.864 | pass |
+
+`v14_bandwidth_sass_probe.py` measures full-read load-only kernels with one per-thread sink store. This is intentionally not a submission; it answers whether the full input read itself can approach the 135-140 us target.
+
+Selected-size results, `threads=256`, `blocks_per_sm=12`, `blocks=1296`, `reps=20`:
+
+| Probe | Mean us | Best us | GB/s | Notes |
+| --- | ---: | ---: | ---: | --- |
+| `torch_copy_d2d` | 311.654 | 309.248 | 1345.8 | counts read + write bytes |
+| `torch_sum_fp32` | 175.718 | 174.080 | 1193.5 | PyTorch FP32 sum |
+| `load_scalar_sink` | 177.613 | 175.104 | 1188.2 | scalar load + per-thread sink |
+| `load_float2_sink` | 172.902 | 169.984 | 1220.6 | 64-bit load shape |
+| `load_float4_sink` | 169.062 | 166.912 | 1248.3 | best load-only probe |
+| `load_float4_ldg_sink` | 172.698 | 171.008 | 1222.0 | `__ldg`, slower |
+| `load_float4_cg_sink` | 173.722 | 172.032 | 1214.8 | inline `ld.global.cg`, slower |
+| `load_float4_ca_sink` | 173.107 | 171.008 | 1219.1 | inline `ld.global.ca`, slower |
+| `load_float4_tile4_sink` | 169.370 | 166.912 | 1246.0 | tile4 load-only, same wall |
+
+SASS/ptxas observations:
+
+| Kernel | Load instruction | Registers | Spills |
+| --- | --- | ---: | ---: |
+| `load_float4_sink_kernel` | `LDG.E.128.CONSTANT` | 30 | 0 |
+| `load_float4_tile4_sink_kernel` | `LDG.E.128.CONSTANT` | 32 | 0 |
+| `load_float4_cg_sink_kernel` | `LDG.E.128.STRONG.GPU` | 16 | 0 |
+| `load_float4_ca_sink_kernel` | `LDG.E.128.STRONG.SM` | 16 | 0 |
+| `load_float2_sink_kernel` | `LDG.E.64.CONSTANT` | 18 | 0 |
+| `load_scalar_sink_kernel` | `LDG.E.CONSTANT` | 16 | 0 |
+
+Interpretation:
+
+- The best load-only full-read probe is still about 169 us mean / 166.9 us best. That is effectively the same wall as `v12c`.
+- Regular compiler-generated `float4` already becomes 128-bit global loads. Inline PTX cache modifiers are reflected in SASS, but they are slower here.
+- Register pressure and spills are not the explanation for the rank gap in this load-only kernel: there are no spills, and the lower-register `cg/ca` variants do not improve timing.
+- On this GCP A100 plus official-style L2-clear harness, exact full-read does not currently show a path to 135-140 us. The rank1 gap is therefore likely environment/runner bandwidth, a materially different low-level implementation, or a problem-structure shortcut rather than final reduction tuning.
+
+Decision:
+
+- Do not spend more time on generic exact reduction tuning unless a new probe first shows load-only below 145 us.
+- The next useful exact step is external comparison: inspect public high-ranking code if available, or run the same v14 probe on another A100 runner.
+- If staying in this repo, the next research path is not `v15` yet; it is explaining why load-only is stuck at 166-169 us while rank1 implies about 1.55 TB/s effective read.
