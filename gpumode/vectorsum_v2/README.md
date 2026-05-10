@@ -434,3 +434,37 @@ Decision:
 - Exact full-read on this runner is now boxed in by three independent observations: `v12c` exact timing, load-only sink timing, and SASS/ptxas showing 128-bit loads with no spills.
 - Do not start `v15_exact_ptx_atomic_fast` from this evidence. There is no load-only headroom for it to exploit.
 - The next meaningful step is outside this local exact-tuning loop: run v14 on a different A100/official runner, or obtain a high-ranking public code pattern. If neither changes the evidence, move to a rule-conscious estimator/shortcut research branch rather than another exact reduction variant.
+
+## Official Runner Calibration
+
+2026-05-10 Popcorn official runner results changed the diagnosis:
+
+- The same atomic exact family that is stuck near 165-166 us on the GCP A100 reaches the 139-145 us band on the official Modal A100 runners.
+- `v14_official_calibration.py` fixes the Popcorn stream checker issue by using default stream launches. The earlier `at::cuda::getCurrentCUDAStream()` launch pattern was rejected as work on another stream.
+- `v14_official_calibration.py` benchmarked well, but leaderboard recheck failed correctness by a narrow tolerance miss:
+  - benchmark: about 139-144 us depending on runner, best 135-137 us
+  - ranked failure example: custom `3559366912.0`, reference `3559329024.0`
+- `v16`-style double local accumulation had the same failure value, so the main error was not thread-local summation. The culprit is the final unordered FP32 atomic accumulation across too many block partials.
+- Centering the input around the first value was slower/less accurate for this path; it changed the error in the wrong direction.
+
+The successful fix was to reduce block partial count while preserving enough parallelism:
+
+| Candidate | Blocks/SM | Threads | Official result | Status |
+| --- | ---: | ---: | --- | --- |
+| `v17_double_bps4_atomic.py` | 4 | 256 | ranked 141 us, best 138 us | passed leaderboard |
+| `v19_double_bps8_atomic.py` | 8 | 256 | ranked 139 us, best 133 us | passed leaderboard |
+| `v22_double_t128_bps8_atomic.py` | 8 | 128 | ranked 142 us, best 133 us | passed, slower |
+
+Live leaderboard check after `v19` submission:
+
+- `brianyu`, `v19_double_bps8_atomic.py`, submission `782354`
+- A100 rank 6
+- score `138.803 us`
+- rank1 remains `135.339 us`
+
+Updated interpretation:
+
+- The earlier 160 us wall was mostly runner/environment bandwidth, not only kernel structure.
+- For the official runner, exact full-read is viable. The tight tradeoff is now blocks-per-SM versus final FP32 atomic error.
+- `bps12` is fast but fails recheck by about one ULP-scale tolerance margin. `bps8` is the current best stable point.
+- Further official attempts are rate-limited: the session hit the hourly leaderboard submission cap after `v19`/`v22`. Next useful probes after cooldown are `bps9`/`bps10`, or a safe two-pass/compensated final reducer only if it can stay under about 138 us.
