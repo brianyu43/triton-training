@@ -1,9 +1,22 @@
 bin/
 build/
 results/
+bench_results/
 *.o
 *.out
 *.csv
+
+# Project-local generated outputs
+**/out/
+**/checkpoints/
+**/wandb/
+
+# NanoTriton-LM generated data and fetched external references.
+nanotriton-lm/data/**/input.txt
+nanotriton-lm/data/**/*.bin
+nanotriton-lm/data/**/meta.json
+nanotriton-lm/references/*/
+!nanotriton-lm/references/MANIFEST.md
 
 # macOS
 .DS_Store

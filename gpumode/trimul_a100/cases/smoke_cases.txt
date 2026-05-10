@@ -1,0 +1,2 @@
+seqlen:32;bs:1;dim:128;hiddendim:128;seed:9371;nomask:1;distribution:normal
+seqlen:32;bs:1;dim:128;hiddendim:128;seed:1092;nomask:0;distribution:normal
