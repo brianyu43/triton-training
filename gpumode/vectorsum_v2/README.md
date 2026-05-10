@@ -391,3 +391,46 @@ Decision:
 - Do not spend more time on generic exact reduction tuning unless a new probe first shows load-only below 145 us.
 - The next useful exact step is external comparison: inspect public high-ranking code if available, or run the same v14 probe on another A100 runner.
 - If staying in this repo, the next research path is not `v15` yet; it is explaining why load-only is stuck at 166-169 us while rank1 implies about 1.55 TB/s effective read.
+
+## V14 Micro-Probe Follow-Up
+
+2026-05-10 follow-up after committing the initial v14 evidence:
+
+Public pattern search:
+
+- GitHub code search did not find the A100 rank1 file `cuda_000013.py` or a public Kernel-Zhang `vectorsum_v2` implementation.
+- The visible public `vectorsum_v2` implementations are starter/baseline style. One external repo uses Triton block sums stored back into the input and then `input[:n_blocks].sum()`. Another tinygrad example does a conventional two-stage reduction. Neither explains a 135 us A100 path.
+- The AutoKernel paper/news trail mentions a first-place `vectorsum_v2` result on B200, not the A100 rank1 we are chasing.
+
+Additional load-only probes added:
+
+- `load_float4_sink_var`: same grid-stride float4 read as `load_float4_sink`, but without `__launch_bounds__`, so thread count can be swept.
+- `load_float4_block_chunk_sink`: each block owns one contiguous chunk of the vector.
+- `load_float4_asm_sink`: intended as a no-store sink experiment, but it is not a valid bandwidth measurement because ptxas optimizes the load loop away; treat this as a dead-code-elimination sentinel only.
+
+Micro-sweep results:
+
+| Probe | Threads | Blocks/SM | Mean us | Best us | Notes |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `load_float4_sink` | 256 | 12 | 174.848 | 166.912 | short run after rebuild, noisy |
+| `load_float4_sink_var` | 256 | 12 | 168.704 | 167.936 | no material gain over original |
+| `load_float4_block_chunk_sink` | 256 | 12 | 173.056 | 171.008 | contiguous block ownership is slower |
+| `load_float4_sink_var` | 128 | 16 | 166.144 | 165.888 | best micro-probe result |
+| `load_float4_block_chunk_sink` | 128 | 16 | 170.368 | 168.960 | still slower |
+| `load_float4_sink_var` | 512 | 8 | 168.576 | 166.912 | slower than 128-thread |
+| `load_float4_block_chunk_sink` | 512 | 8 | 171.136 | 167.936 | slower |
+| `load_float4_sink_var` | 128 | 8 | 166.144 | 165.888 | same as 128 threads, 16 blocks/SM |
+| `load_float4_sink_var` | 128 | 24 | 168.064 | 166.912 | too many CTAs hurts |
+
+Updated interpretation:
+
+- The best load-only result improved from about 169 us to 166.144 us by using 128 threads, but that only reaches the same wall as `v12c`.
+- Removing `__launch_bounds__`, reducing thread count, and changing CTA count do not expose a path below 145 us, let alone 135-140 us.
+- Block-contiguous ownership is consistently slower in load-only form, matching the earlier v13 result where chunked ownership also worsened the zero/atomic race.
+- The no-store asm-sink experiment proves the opposite of what we wanted: without a real side effect, the compiler can remove the loop. Keep sink-store/checksum style probes for trustworthy bandwidth measurements.
+
+Decision:
+
+- Exact full-read on this runner is now boxed in by three independent observations: `v12c` exact timing, load-only sink timing, and SASS/ptxas showing 128-bit loads with no spills.
+- Do not start `v15_exact_ptx_atomic_fast` from this evidence. There is no load-only headroom for it to exploit.
+- The next meaningful step is outside this local exact-tuning loop: run v14 on a different A100/official runner, or obtain a high-ranking public code pattern. If neither changes the evidence, move to a rule-conscious estimator/shortcut research branch rather than another exact reduction variant.

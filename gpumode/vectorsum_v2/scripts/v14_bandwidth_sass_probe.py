@@ -59,6 +59,9 @@ void empty_launch(torch::Tensor sink);
 void load_scalar_sink(torch::Tensor x, torch::Tensor sink, int blocks, int threads);
 void load_float2_sink(torch::Tensor x, torch::Tensor sink, int blocks, int threads);
 void load_float4_sink(torch::Tensor x, torch::Tensor sink, int blocks, int threads);
+void load_float4_sink_var(torch::Tensor x, torch::Tensor sink, int blocks, int threads);
+void load_float4_asm_sink(torch::Tensor x, int blocks, int threads);
+void load_float4_block_chunk_sink(torch::Tensor x, torch::Tensor sink, int blocks, int threads);
 void load_float4_ldg_sink(torch::Tensor x, torch::Tensor sink, int blocks, int threads);
 void load_float4_cg_sink(torch::Tensor x, torch::Tensor sink, int blocks, int threads);
 void load_float4_ca_sink(torch::Tensor x, torch::Tensor sink, int blocks, int threads);
@@ -69,6 +72,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("load_scalar_sink", &load_scalar_sink, "scalar full-read sink");
   m.def("load_float2_sink", &load_float2_sink, "float2 full-read sink");
   m.def("load_float4_sink", &load_float4_sink, "float4 full-read sink");
+  m.def("load_float4_sink_var", &load_float4_sink_var, "float4 full-read sink, variable thread launch");
+  m.def("load_float4_asm_sink", &load_float4_asm_sink, "float4 full-read asm sink");
+  m.def("load_float4_block_chunk_sink", &load_float4_block_chunk_sink, "float4 block-contiguous chunk sink");
   m.def("load_float4_ldg_sink", &load_float4_ldg_sink, "__ldg float4 full-read sink");
   m.def("load_float4_cg_sink", &load_float4_cg_sink, "ld.global.cg float4 full-read sink");
   m.def("load_float4_ca_sink", &load_float4_ca_sink, "ld.global.ca float4 full-read sink");
@@ -157,6 +163,45 @@ __global__ __launch_bounds__(256, 8) void load_float4_sink_kernel(
     sum += sum4(x4[idx]);
   }
   sink[tid] = sum;
+}
+
+__global__ void load_float4_sink_var_kernel(
+    const float4* __restrict__ x4,
+    float* __restrict__ sink,
+    int n4) {
+  const int stride = blockDim.x * gridDim.x;
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  float sum = 0.0f;
+  for (int idx = tid; idx < n4; idx += stride) {
+    sum += sum4(x4[idx]);
+  }
+  sink[tid] = sum;
+}
+
+__global__ void load_float4_asm_sink_kernel(
+    const float4* __restrict__ x4,
+    int n4) {
+  const int stride = blockDim.x * gridDim.x;
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  float sum = 0.0f;
+  for (int idx = tid; idx < n4; idx += stride) {
+    sum += sum4(x4[idx]);
+  }
+  asm volatile("mov.f32 %0, %0;" : "+f"(sum));
+}
+
+__global__ void load_float4_block_chunk_sink_kernel(
+    const float4* __restrict__ x4,
+    float* __restrict__ sink,
+    int n4) {
+  const int chunk = (n4 + gridDim.x - 1) / gridDim.x;
+  const int begin = blockIdx.x * chunk;
+  const int end = min(begin + chunk, n4);
+  float sum = 0.0f;
+  for (int idx = begin + threadIdx.x; idx < end; idx += blockDim.x) {
+    sum += sum4(x4[idx]);
+  }
+  sink[blockIdx.x * blockDim.x + threadIdx.x] = sum;
 }
 
 __global__ __launch_bounds__(256, 8) void load_float4_ldg_sink_kernel(
@@ -259,6 +304,41 @@ void load_float4_sink(torch::Tensor x, torch::Tensor sink, int blocks, int threa
   const int64_t n4 = x.numel() >> 2;
   TORCH_CHECK(n4 <= static_cast<int64_t>(2147483647), "n/4 must fit int32");
   load_float4_sink_kernel<<<blocks, threads, 0, stream>>>(
+      reinterpret_cast<const float4*>(x.data_ptr<float>()),
+      sink.data_ptr<float>(),
+      static_cast<int>(n4));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void load_float4_sink_var(torch::Tensor x, torch::Tensor sink, int blocks, int threads) {
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  TORCH_CHECK((x.numel() & 3) == 0, "n must be divisible by 4");
+  const int64_t n4 = x.numel() >> 2;
+  TORCH_CHECK(n4 <= static_cast<int64_t>(2147483647), "n/4 must fit int32");
+  load_float4_sink_var_kernel<<<blocks, threads, 0, stream>>>(
+      reinterpret_cast<const float4*>(x.data_ptr<float>()),
+      sink.data_ptr<float>(),
+      static_cast<int>(n4));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void load_float4_asm_sink(torch::Tensor x, int blocks, int threads) {
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  TORCH_CHECK((x.numel() & 3) == 0, "n must be divisible by 4");
+  const int64_t n4 = x.numel() >> 2;
+  TORCH_CHECK(n4 <= static_cast<int64_t>(2147483647), "n/4 must fit int32");
+  load_float4_asm_sink_kernel<<<blocks, threads, 0, stream>>>(
+      reinterpret_cast<const float4*>(x.data_ptr<float>()),
+      static_cast<int>(n4));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void load_float4_block_chunk_sink(torch::Tensor x, torch::Tensor sink, int blocks, int threads) {
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  TORCH_CHECK((x.numel() & 3) == 0, "n must be divisible by 4");
+  const int64_t n4 = x.numel() >> 2;
+  TORCH_CHECK(n4 <= static_cast<int64_t>(2147483647), "n/4 must fit int32");
+  load_float4_block_chunk_sink_kernel<<<blocks, threads, 0, stream>>>(
       reinterpret_cast<const float4*>(x.data_ptr<float>()),
       sink.data_ptr<float>(),
       static_cast<int>(n4));
@@ -439,6 +519,14 @@ def main() -> None:
         ("load_scalar_sink", lambda: ext.load_scalar_sink(x, sink, blocks, args.threads), input_bytes + sink_bytes, True),
         ("load_float2_sink", lambda: ext.load_float2_sink(x, sink, blocks, args.threads), input_bytes + sink_bytes, True),
         ("load_float4_sink", lambda: ext.load_float4_sink(x, sink, blocks, args.threads), input_bytes + sink_bytes, True),
+        ("load_float4_sink_var", lambda: ext.load_float4_sink_var(x, sink, blocks, args.threads), input_bytes + sink_bytes, True),
+        ("load_float4_asm_sink", lambda: ext.load_float4_asm_sink(x, blocks, args.threads), input_bytes, False),
+        (
+            "load_float4_block_chunk_sink",
+            lambda: ext.load_float4_block_chunk_sink(x, sink, blocks, args.threads),
+            input_bytes + sink_bytes,
+            True,
+        ),
         ("load_float4_ldg_sink", lambda: ext.load_float4_ldg_sink(x, sink, blocks, args.threads), input_bytes + sink_bytes, True),
         ("load_float4_cg_sink", lambda: ext.load_float4_cg_sink(x, sink, blocks, args.threads), input_bytes + sink_bytes, True),
         ("load_float4_ca_sink", lambda: ext.load_float4_ca_sink(x, sink, blocks, args.threads), input_bytes + sink_bytes, True),
@@ -460,6 +548,9 @@ def main() -> None:
                 "load_scalar_sink_kernel",
                 "load_float2_sink_kernel",
                 "load_float4_sink_kernel",
+                "load_float4_sink_var_kernel",
+                "load_float4_asm_sink_kernel",
+                "load_float4_block_chunk_sink_kernel",
                 "load_float4_ldg_sink_kernel",
                 "load_float4_cg_sink_kernel",
                 "load_float4_ca_sink_kernel",
